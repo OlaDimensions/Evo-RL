@@ -266,7 +266,7 @@ def speed_test(cfg: CANSetupConfig, interface: str):
 
     responding_motor = None
     for motor_id in cfg.motor_ids:
-        responses, _ = test_motor(bus, motor_id, 0.5, cfg.use_fd)
+        responses, _ = test_motor(bus, motor_id, 0.5, effective_use_fd)
         if responses:
             responding_motor = motor_id
             break
@@ -285,7 +285,7 @@ def speed_test(cfg: CANSetupConfig, interface: str):
             arbitration_id=responding_motor,
             data=[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC],
             is_extended_id=False,
-            is_fd=cfg.use_fd,
+            is_fd=effective_use_fd,
         )
         bus.send(msg)
         resp = bus.recv(timeout=0.1)
