@@ -32,7 +32,11 @@ from lerobot.configs import parser
 from lerobot.scripts.lerobot_record import RecordConfig, record
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.recording_annotations import EPISODE_FAILURE, infer_collector_policy_version
+from lerobot.utils.recording_annotations import (
+    EPISODE_FAILURE,
+    EPISODE_SUCCESS,
+    infer_collector_policy_version,
+)
 
 
 def _default_failure_reset_pose_path(cfg: RecordConfig) -> Path:
@@ -82,7 +86,7 @@ def _slow_reset_all_arms_to_pose(
 ) -> None:
     joint_keys = [key for key in robot.action_features if key.endswith(".pos") and key in target_pose]
     if not joint_keys:
-        logging.warning("No matching '.pos' joints found for failure reset pose.")
+        logging.warning("No matching '.pos' joints found for the stored reset pose.")
         return
 
     current_pose = _extract_joint_pos_from_observation(robot.get_observation())
@@ -102,7 +106,7 @@ def _slow_reset_all_arms_to_pose(
             teleop.send_feedback(action)
         time.sleep(step_dt_s)
 
-    logging.info("Episode marked as failure. Arms returned to failure reset pose in %.1fs.", duration_s)
+    logging.info("Episode ended. Arms returned to the stored reset pose in %.1fs.", duration_s)
 
 
 class _HumanInloopFailureResetController:
@@ -123,7 +127,7 @@ class _HumanInloopFailureResetController:
         self.failure_reset_pose = _save_failure_reset_pose(robot=robot, pose_path=self.pose_path)
 
     def on_episode_outcome(self, robot: Any, teleop: Any, episode_success: str | None) -> None:
-        if episode_success == EPISODE_FAILURE and self.failure_reset_pose is not None:
+        if episode_success in {EPISODE_FAILURE, EPISODE_SUCCESS} and self.failure_reset_pose is not None:
             _slow_reset_all_arms_to_pose(robot=robot, teleop=teleop, target_pose=self.failure_reset_pose)
 
 

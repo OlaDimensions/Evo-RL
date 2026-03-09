@@ -43,6 +43,7 @@ from lerobot.scripts.lerobot_record import (
 )
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.utils.recording_annotations import EPISODE_SUCCESS
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobot, MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleop, MockTeleopConfig
@@ -275,6 +276,34 @@ def test_human_inloop_failure_reset_controller_reuses_existing_pose(tmp_path):
     assert controller.failure_reset_pose == {"motor_1.pos": 1.0, "motor_2.pos": -2.0}
     mock_input.assert_not_called()
     mock_save.assert_not_called()
+
+
+def test_human_inloop_failure_reset_controller_resets_on_success(tmp_path):
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "hil_with_policy_success_reset",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        teleop=teleop_cfg,
+        play_sounds=False,
+    )
+    controller = _HumanInloopFailureResetController(cfg)
+    controller.failure_reset_pose = {"motor_1.pos": 1.0, "motor_2.pos": -2.0}
+
+    with patch("lerobot.scripts.lerobot_human_inloop_record._slow_reset_all_arms_to_pose") as mock_reset:
+        controller.on_episode_outcome(robot=MagicMock(), teleop=MagicMock(), episode_success=EPISODE_SUCCESS)
+
+    mock_reset.assert_called_once()
+    assert mock_reset.call_args.kwargs["target_pose"] == {"motor_1.pos": 1.0, "motor_2.pos": -2.0}
 
 
 def test_slow_reset_all_arms_to_pose_uses_interpolation():
