@@ -225,13 +225,13 @@ For single-arm users, run the command below to verify the system is ready:
 
 ```bash
 lerobot-teleoperate \
-  --robot.type=piperx_follower \
-  --robot.port=<FOLLOWER_CAN_PORT> \
-  --robot.id=my_piperx_follower \
+  --robot.type=piper_follower \
+  --robot.port=can_right \
+  --robot.id=my_piper_follower \
   --robot.require_calibration=false \
-  --teleop.type=piperx_leader \
-  --teleop.port=<LEADER_CAN_PORT> \
-  --teleop.id=my_piperx_leader \
+  --teleop.type=piper_leader \
+  --teleop.port=can_left \
+  --teleop.id=my_piper_leader \
   --teleop.require_calibration=false
 ```
 
@@ -331,6 +331,28 @@ lerobot-dataset-report --dataset <HF_USERNAME_OR_ORG>/<DATASET_NAME>
 ```
 
 This prints: dataset meta, totals, episode-length stats/histogram, success/intervention metrics, task list, and full feature schema.
+
+If you would to keep only success-labeled episodes and save them as a new dataset:
+
+```bash
+lerobot-filter-dataset-success \
+  --dataset <HF_USERNAME_OR_ORG>/<DATASET_NAME> \
+  --output-dir ~/.cache/huggingface/lerobot/local/<DATASET_NAME>_success_only
+```
+
+You can also pass a local dataset path recorded by `lerobot-human-inloop-record`:
+
+```bash
+lerobot-filter-dataset-success \
+  --dataset ~/.cache/huggingface/lerobot/local/<DATASET_NAME> \
+  --output-dir ~/.cache/huggingface/lerobot/local/<DATASET_NAME>_success_only
+```
+
+Notes:
+
+- The script reads episode-level labels from `meta/episodes` field `episode_success`.
+- Only episodes labeled `success` are kept; `failure` and unlabeled episodes are excluded.
+- The new dataset is rebuilt with the existing LeRobot dataset tooling, so videos, tasks, stats, and extra episode metadata are preserved.
 
 <a id="value-function-training"></a>
 
