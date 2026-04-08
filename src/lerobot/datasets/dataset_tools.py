@@ -783,11 +783,20 @@ def _copy_and_reindex_videos(
                 )
 
                 cumulative_ts = 0.0
+                total_source_duration = 0.0
                 for old_idx in sorted_keep_episodes:
                     new_idx = episode_mapping[old_idx]
                     src_ep = src_dataset.meta.episodes[old_idx]
-                    ep_length = src_ep["length"]
-                    ep_duration = ep_length / src_dataset.meta.fps
+                    from_ts = float(src_ep[f"videos/{video_key}/from_timestamp"])
+                    to_ts = float(src_ep[f"videos/{video_key}/to_timestamp"])
+                    ep_duration = to_ts - from_ts
+                    if ep_duration <= 0:
+                        raise ValueError(
+                            "Invalid non-positive source video duration while re-encoding mixed video file: "
+                            f"episode_index={old_idx}, video_key={video_key}, "
+                            f"chunk_index={src_chunk_idx}, file_index={src_file_idx}, "
+                            f"from_timestamp={from_ts}, to_timestamp={to_ts}"
+                        )
 
                     episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
                     episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
@@ -797,6 +806,13 @@ def _copy_and_reindex_videos(
                     )
 
                     cumulative_ts += ep_duration
+                    total_source_duration += ep_duration
+
+                logging.info(
+                    f"Re-encoded {video_key} (chunk {src_chunk_idx}, file {src_file_idx}) "
+                    f"using source span durations: kept_episodes={len(sorted_keep_episodes)}, "
+                    f"total_duration_s={total_source_duration:.6f}"
+                )
 
     return episodes_video_metadata
 
