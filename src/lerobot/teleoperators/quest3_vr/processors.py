@@ -49,6 +49,8 @@ def make_quest3_vr_robot_action_processor_from_config(cfg: Quest3VRTeleopConfig)
     step = EEToJointIKProcessorStep(
         ik_backend=backend,
         arm_init_T=arm_init_T,
+        dead_zone_pos=cfg.pos_dead,
+        dead_zone_rot=cfg.rot_dead,
         async_solve=cfg.async_ik,
         reset_interp_steps=cfg.reset_interp_steps,
     )
@@ -69,6 +71,8 @@ def make_bi_quest3_vr_robot_action_processor_from_config(cfg: BiQuest3VRTeleopCo
         left_step=EEToJointIKProcessorStep(
             ik_backend=left_backend,
             arm_init_T=arm_init_T,
+            dead_zone_pos=cfg.pos_dead,
+            dead_zone_rot=cfg.rot_dead,
             input_prefix="left_",
             output_prefix="left_",
             enable_key="enabled",
@@ -80,6 +84,8 @@ def make_bi_quest3_vr_robot_action_processor_from_config(cfg: BiQuest3VRTeleopCo
         right_step=EEToJointIKProcessorStep(
             ik_backend=right_backend,
             arm_init_T=arm_init_T,
+            dead_zone_pos=cfg.pos_dead,
+            dead_zone_rot=cfg.rot_dead,
             input_prefix="right_",
             output_prefix="right_",
             enable_key="enabled",

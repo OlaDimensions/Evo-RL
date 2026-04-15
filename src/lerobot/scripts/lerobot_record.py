@@ -121,6 +121,12 @@ from lerobot.teleoperators import (  # noqa: F401
     so_leader,
     unitree_g1,
 )
+from lerobot.teleoperators.bi_quest3_vr.config_bi_quest3_vr import BiQuest3VRTeleopConfig  # noqa: F401
+from lerobot.teleoperators.quest3_vr.config_quest3_vr import Quest3VRTeleopConfig  # noqa: F401
+from lerobot.teleoperators.quest3_vr.processors import (
+    make_bi_quest3_vr_robot_action_processor_from_config,
+    make_quest3_vr_robot_action_processor_from_config,
+)
 from lerobot.utils.constants import ACTION
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
@@ -338,6 +344,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    if cfg.teleop is not None and cfg.teleop.type == "quest3_vr":
+        robot_action_processor = make_quest3_vr_robot_action_processor_from_config(cfg.teleop)
+    elif cfg.teleop is not None and cfg.teleop.type == "bi_quest3_vr":
+        robot_action_processor = make_bi_quest3_vr_robot_action_processor_from_config(cfg.teleop)
 
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(

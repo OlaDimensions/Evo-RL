@@ -44,5 +44,5 @@ _check_stack
 exec env \
   PYTHONPATH="$VT3_SITE:${PYTHONPATH:-}" \
   LD_LIBRARY_PATH="$VT3_ROOT/lib:${LD_LIBRARY_PATH:-}" \
-  "$EVO_PY" -m lerobot.scripts.lerobot_teleoperate "$@"
-
+  # "$EVO_PY" -m lerobot.scripts.lerobot_teleoperate "$@"
+  lerobot-teleoperate     --robot.type=piper_follower     --robot.port=can_left     --teleop.type=quest3_vr  --fps=30

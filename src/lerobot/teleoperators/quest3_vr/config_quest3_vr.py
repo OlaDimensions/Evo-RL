@@ -46,18 +46,23 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     rot_scale: float = 0.4
 
     # Gripper control
-    gripper_open_value: float = 0.08
-    gripper_close_value: float = 0.0
+    gripper_open_value: float = 80
+    gripper_close_value: float = -67
     trigger_threshold: float = 0.5
 
     # IK bridge enablement
     async_ik: bool = True
     reset_interp_steps: int = 25
-    piper_urdf_path: str = "src/lerobot/assets/piper_description/urdf/piper_no_gripper_description.urdf"
-    piper_package_dir: str = "src/lerobot/assets/piper_description"
+    # URDF variant switch:
+    # - "with_gripper": use piper_description_with_g assets and lock joint7/joint8 in IK
+    # - "no_gripper": use legacy 6-DOF no-gripper assets
+    # - "custom": use user-provided piper_urdf_path / piper_package_dir as-is
+    piper_urdf_variant: str = "with_gripper"
+    piper_urdf_path: str = "src/lerobot/assets/piper_description_with_g/urdf/piper_description.urdf"
+    piper_package_dir: str = "src/lerobot/assets/piper_description_with_g"
     piper_ee_link_name: str = "ee"
     piper_ee_link_joint_name: str = "joint6"
-    piper_locked_joint_names: tuple[str, str] = ()
+    piper_locked_joint_names: tuple[str, ...] = ()
     piper_ee_offset_xyzrpy: tuple[float, float, float, float, float, float] = (0.0, 0.0, 0.13, 0.0, -1.57, 0.0)
     arm_init_xyzrpy: tuple[float, float, float, float, float, float] = (0.19, 0.0, 0.2, 0.0, 0.0, 0.0)
 
@@ -70,6 +75,19 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     log_only_on_enable: bool = True
 
     def __post_init__(self):
+        if self.piper_urdf_variant == "with_gripper":
+            self.piper_urdf_path = "src/lerobot/assets/piper_description_with_g/urdf/piper_description.urdf"
+            self.piper_package_dir = "src/lerobot/assets/piper_description_with_g"
+            if not self.piper_locked_joint_names:
+                self.piper_locked_joint_names = ("joint7", "joint8")
+        elif self.piper_urdf_variant == "no_gripper":
+            self.piper_urdf_path = "src/lerobot/assets/piper_description/urdf/piper_no_gripper_description.urdf"
+            self.piper_package_dir = "src/lerobot/assets/piper_description"
+            if not self.piper_locked_joint_names:
+                self.piper_locked_joint_names = ()
+        elif self.piper_urdf_variant != "custom":
+            raise ValueError("`piper_urdf_variant` must be one of: with_gripper, no_gripper, custom.")
+
         if not (0.0 < self.smooth_alpha <= 1.0):
             raise ValueError("`smooth_alpha` must be in (0, 1].")
         if self.pos_dead < 0 or self.rot_dead < 0:

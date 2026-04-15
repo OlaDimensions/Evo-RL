@@ -53,6 +53,7 @@ class EETargetState:
     solve_generation: int = 0
     last_seed_source: str = "none"
     last_seed_log_t: float = 0.0
+    last_target_log_t: float = 0.0
 
 
 @ProcessorStepRegistry.register("ee_to_joint_ik")
@@ -80,6 +81,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
     def action(self, action: RobotAction) -> RobotAction:
         if self.ik_backend is None:
             raise RuntimeError("EEToJointIKProcessorStep requires an ik_backend instance.")
+        gripper = float(action.get(self._in(self.gripper_key), 0.0))
 
         # Preserve quest3VR_ws semantics: reset motion keeps running for several ticks.
         if self._state.reset_plan:
@@ -98,34 +100,38 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             with self._lock:
                 self._state.solve_generation += 1
                 self._state.async_action_ready = None
-            return self._idle_action()
+            return self._idle_action(gripper)
 
         # Deliver async result first if available.
         async_ready = self._pop_async_ready()
         if async_ready is not None:
-            return async_ready
+            return self._with_current_gripper(async_ready, gripper)
 
-        delta_pos, delta_rot = self._action_to_delta_components(action)
-        if self._is_in_dead_zone(delta_pos, delta_rot):
-            return self._idle_action()
+        abs_target_T = self._action_to_absolute_target(action)
+        if abs_target_T is None:
+            delta_pos, delta_rot = self._action_to_delta_components(action)
+            if self._is_in_dead_zone(delta_pos, delta_rot):
+                return self._idle_action(gripper)
+        else:
+            delta_pos = np.zeros(3, dtype=np.float64)
+            delta_rot = np.zeros(3, dtype=np.float64)
 
         with self._lock:
             if not self._state.armed:
                 self._state.target_T = self.arm_init_T.copy()
                 self._state.armed = True
 
-            # Mirror quest3VR_ws behavior: while an async IK solve is in-flight,
-            # do not keep integrating target deltas to avoid large target jumps.
-            if self.async_solve and self._state.ik_inflight:
-                return self._idle_action()
-
-            self._state.target_T = self._state.target_T.copy()
-            self._state.target_T[:3, 3] = self._state.target_T[:3, 3] + delta_pos
-            self._state.target_T[:3, :3] = self._state.target_T[:3, :3] @ pin.exp3(delta_rot)
+            if abs_target_T is not None:
+                self._state.target_T = abs_target_T.copy()
+            else:
+                self._state.target_T = self._state.target_T.copy()
+                self._state.target_T[:3, 3] = self._state.target_T[:3, 3] + delta_pos
+                self._state.target_T[:3, :3] = self._state.target_T[:3, :3] @ pin.exp3(delta_rot)
 
             q_seed, seed_source = self._pick_seed()
             self._log_seed_source(seed_source)
             target_T = self._state.target_T.copy()
+            self._log_target(target_T, q_seed, seed_source, gripper, abs_target_T is not None)
 
             if self.async_solve:
                 if not self._state.ik_inflight:
@@ -137,25 +143,30 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
                         args=(
                             target_T,
                             q_seed,
-                            float(action.get(self._in(self.gripper_key), 0.0)),
+                            gripper,
                             seed_source,
                             generation,
                         ),
                         daemon=True,
                     )
                     thread.start()
-                return self._idle_action()
+                return self._idle_action(gripper)
 
         # Synchronous fallback.
         result = self.ik_backend.solve(target_T, q_seed=q_seed)
-        return self._result_to_action(result, float(action.get(self._in(self.gripper_key), 0.0)), seed_source)
+        return self._result_to_action(result, gripper, seed_source)
 
     def _build_reset_plan(self, action: RobotAction) -> None:
         self._state.target_T = self.arm_init_T.copy()
         self._state.armed = True
 
         q_start, _ = self._pick_seed()
-        q_goal = self.ik_backend.home_q()
+        result = self.ik_backend.solve(self.arm_init_T, q_seed=q_start)
+        if result.success and result.q is not None:
+            q_goal = np.asarray(result.q, dtype=np.float64)
+        else:
+            logger.warning("[IK] failed to solve arm_init_T during reset; falling back to home_q (reason=%s)", result.reason)
+            q_goal = self.ik_backend.home_q()
         steps = max(1, int(self.reset_interp_steps))
         if np.linalg.norm(q_goal - q_start) < 1e-8:
             self._state.reset_plan = [q_goal.copy()]
@@ -199,11 +210,11 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             return ready
 
     def _pick_seed(self) -> tuple[np.ndarray, str]:
-        if self._state.last_q is not None:
-            return self._state.last_q.copy(), "last_q"
         q_seed_from_obs = self._seed_from_observation()
         if q_seed_from_obs is not None:
             return q_seed_from_obs
+        if self._state.last_q is not None:
+            return self._state.last_q.copy(), "last_q"
         return self.ik_backend.home_q(), "home_q"
 
     def _seed_from_observation(self) -> tuple[np.ndarray, str] | None:
@@ -245,15 +256,41 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         drz = float(action.get(self._in("ee.delta_rz"), 0.0)) * self.rotation_scale
         return np.array([dx, dy, dz], dtype=np.float64), np.array([drx, dry, drz], dtype=np.float64)
 
+    def _action_to_absolute_target(self, action: RobotAction) -> np.ndarray | None:
+        keys = [
+            "ee.target_x",
+            "ee.target_y",
+            "ee.target_z",
+            "ee.target_rx",
+            "ee.target_ry",
+            "ee.target_rz",
+        ]
+        values: list[float] = []
+        for key in keys:
+            value = action.get(self._in(key))
+            if value is None:
+                return None
+            values.append(float(value))
+        return self._xyzrpy_to_matrix(*values)
+
     def _is_in_dead_zone(self, delta_pos: np.ndarray, delta_rot: np.ndarray) -> bool:
         return np.linalg.norm(delta_pos) < self.dead_zone_pos and np.linalg.norm(delta_rot) < self.dead_zone_rot
 
     def _result_to_action(self, result: IKSolveResult, gripper: float, seed_source: str) -> RobotAction:
         if result.q is None or not result.success:
             logger.warning("[IK] solve failed; skipping command this tick (reason=%s)", result.reason)
-            return self._idle_action()
+            return self._idle_action(gripper)
         self._state.last_q = np.asarray(result.q, dtype=np.float64)
-        logger.info("[IK] solve_ms=%.2f collision_free=%s seed=%s", result.solve_ms, result.collision_free, seed_source)
+        q_deg = np.rad2deg(self._state.last_q[: len(PIPER_JOINT_ACTION_KEYS)])
+        logger.info(
+            "[IK_TRACE] solve_ms=%.2f collision_free=%s seed=%s q_rad=%s q_deg=%s gripper=%.3f",
+            result.solve_ms,
+            result.collision_free,
+            seed_source,
+            np.array2string(self._state.last_q, precision=5, suppress_small=True),
+            np.array2string(q_deg, precision=3, suppress_small=True),
+            gripper,
+        )
         return self._compose_joint_action(self._state.last_q, gripper)
 
     def _compose_joint_action(self, q: np.ndarray, gripper: float) -> RobotAction:
@@ -268,8 +305,39 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         action[f"{self.output_prefix}{self.absolute_joint_command_key}"] = True
         return action
 
-    def _idle_action(self) -> RobotAction:
-        return {}
+    def _idle_action(self, gripper: float | None = None) -> RobotAction:
+        if gripper is None:
+            return {}
+        return {
+            f"{self.output_prefix}{self.gripper_key}": float(gripper),
+            f"{self.output_prefix}{self.absolute_joint_command_key}": True,
+        }
+
+    def _with_current_gripper(self, action: RobotAction, gripper: float) -> RobotAction:
+        action = copy.copy(action)
+        action[f"{self.output_prefix}{self.gripper_key}"] = float(gripper)
+        return action
+
+    def _log_target(
+        self,
+        target_T: np.ndarray,
+        q_seed: np.ndarray,
+        seed_source: str,
+        gripper: float,
+        absolute_target: bool,
+    ) -> None:
+        now = time.monotonic()
+        if now - self._state.last_target_log_t < 0.5:
+            return
+        self._state.last_target_log_t = now
+        logger.info(
+            "[IK_TRACE] absolute_target=%s gripper=%.3f seed=%s q_seed=%s target_T=%s",
+            absolute_target,
+            gripper,
+            seed_source,
+            np.array2string(q_seed, precision=5, suppress_small=True),
+            np.array2string(target_T, precision=5, suppress_small=True),
+        )
 
     def _log_seed_source(self, seed_source: str) -> None:
         now = time.monotonic()
@@ -293,6 +361,12 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         for key in [
             self.enable_key,
             self.reset_key,
+            "ee.target_x",
+            "ee.target_y",
+            "ee.target_z",
+            "ee.target_rx",
+            "ee.target_ry",
+            "ee.target_rz",
             "ee.delta_x",
             "ee.delta_y",
             "ee.delta_z",

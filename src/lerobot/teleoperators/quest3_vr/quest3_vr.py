@@ -36,8 +36,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ArmRuntime:
-    smooth_pose: np.ndarray | None = None
-    base_pose: np.ndarray | None = None
+    smooth_T: np.ndarray | None = None
+    base_T: np.ndarray | None = None
     enable_prev: bool = False
     reset_prev: bool = False
     trig_prev: bool = False
@@ -58,6 +58,9 @@ class Quest3VRTeleop(Teleoperator):
         self._reader: Any | None = None
         self._is_connected = False
         self._right = ArmRuntime()
+        self._arm_init_T = self._xyzrpy_to_matrix(*self.config.arm_init_xyzrpy)
+        self._right.arm_T = self._arm_init_T.copy()
+        self._right.last_T = self._arm_init_T.copy()
         self._last_input_t = 0.0
         self._last_health_log_t = 0.0
         self._last_input_log_t = 0.0
@@ -70,6 +73,12 @@ class Quest3VRTeleop(Teleoperator):
         return {
             "enabled": bool,
             "reset": bool,
+            "ee.target_x": float,
+            "ee.target_y": float,
+            "ee.target_z": float,
+            "ee.target_rx": float,
+            "ee.target_ry": float,
+            "ee.target_rz": float,
             "ee.delta_x": float,
             "ee.delta_y": float,
             "ee.delta_z": float,
@@ -118,15 +127,15 @@ class Quest3VRTeleop(Teleoperator):
         now = time.monotonic()
         transforms, buttons = self._reader.get_transformations_and_buttons()
 
-        right_pose = self._extract_pose(transforms, "r")
-        if right_pose is None:
+        right_T = self._extract_transform(transforms, "r")
+        if right_T is None:
             age_s = now - self._last_input_t
             self._log_health(now, f"missing controller pose; age={age_s:.3f}s")
             return self._hold_action(gripper_open=self._right.gripper_open, enabled=False, reset=False)
         self._last_input_t = now
 
         action = self._arm_action(
-            pose=right_pose,
+            controller_T=right_T,
             buttons=buttons,
             state=self._right,
             enable_button=self.config.enable_button,
@@ -141,6 +150,11 @@ class Quest3VRTeleop(Teleoperator):
 
     @check_if_not_connected
     def disconnect(self) -> None:
+        if self._reader is not None:
+            try:
+                self._reader.stop()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[VR_HEALTH] failed to stop OculusReader cleanly: %s", exc)
         self._reader = None
         self._is_connected = False
         logger.info("[VR_HEALTH] quest3_vr disconnected")
@@ -151,19 +165,19 @@ class Quest3VRTeleop(Teleoperator):
     def _arm_action(
         self,
         *,
-        pose: np.ndarray | None,
+        controller_T: np.ndarray | None,
         buttons: dict[str, Any],
         state: ArmRuntime,
         enable_button: str,
         reset_button: str,
         gripper_button: str,
     ) -> RobotAction:
-        if pose is None:
+        if controller_T is None:
             return self._hold_action(gripper_open=state.gripper_open, enabled=False, reset=False)
 
-        pose = np.asarray(pose, dtype=np.float64)
-        state.smooth_pose = self._ema(pose, state.smooth_pose, self.config.smooth_alpha)
-        pose = state.smooth_pose
+        controller_T = np.asarray(controller_T, dtype=np.float64)
+        state.smooth_T = self._smooth_transform(controller_T, state.smooth_T, self.config.smooth_alpha)
+        controller_T = state.smooth_T
 
         enable_now = bool(buttons.get(enable_button, False))
         reset_now = bool(buttons.get(reset_button, False))
@@ -171,57 +185,62 @@ class Quest3VRTeleop(Teleoperator):
         trig_now = self._extract_trigger(buttons, gripper_button) > self.config.trigger_threshold
 
         if reset_edge:
-            state.base_pose = pose.copy()
-            state.arm_T = np.eye(4, dtype=np.float64)
-            state.last_T = np.eye(4, dtype=np.float64)
+            state.base_T = controller_T.copy()
+            state.arm_T = self._arm_init_T.copy()
+            state.last_T = self._arm_init_T.copy()
         state.reset_prev = reset_now
 
         if enable_now and not state.enable_prev:
-            state.base_pose = pose.copy()
+            state.base_T = controller_T.copy()
             state.arm_T = state.last_T.copy()
+            # If trigger is already held when entering teleop, treat it as a fresh
+            # press so B+trigger "simultaneous" operation still toggles gripper.
+            state.trig_prev = False
         elif (not enable_now) and state.enable_prev:
             state.arm_T = state.last_T.copy()
         state.enable_prev = enable_now
 
-        if trig_now and not state.trig_prev:
+        # Toggle gripper only during active teleoperation (B/enable held).
+        if enable_now and trig_now and not state.trig_prev:
             state.gripper_open = not state.gripper_open
         state.trig_prev = trig_now
 
         if not enable_now:
             return self._hold_action(gripper_open=state.gripper_open, enabled=False, reset=reset_edge)
 
-        if state.base_pose is None:
-            state.base_pose = pose.copy()
+        if state.base_T is None:
+            state.base_T = controller_T.copy()
 
-        raw_dp = pose[:3] - state.base_pose[:3]
-        raw_dr = pose[3:] - state.base_pose[3:]
+        raw_dp = controller_T[:3, 3] - state.base_T[:3, 3]
+        raw_dr = self._rotation_vector_from_matrix(state.base_T[:3, :3].T @ controller_T[:3, :3])
         in_dead_zone = float(np.max(np.abs(raw_dp))) < self.config.pos_dead and float(np.max(np.abs(raw_dr))) < self.config.rot_dead
         if in_dead_zone:
             return self._hold_action(gripper_open=state.gripper_open, enabled=True, reset=reset_edge)
 
-        current_T = self._xyzrpy_to_matrix(*pose.tolist())
-        base_T = self._xyzrpy_to_matrix(*state.base_pose.tolist())
-        delta_pos_raw = current_T[:3, 3] - base_T[:3, 3]
-        dead_band = np.array([0.0, 0.018, 0.0], dtype=np.float64)
-        delta_pos = np.sign(delta_pos_raw) * np.maximum(np.abs(delta_pos_raw) - dead_band, 0.0) * self.config.pos_scale
-        delta_rot = self._rotation_vector_from_matrix(base_T[:3, :3].T @ current_T[:3, :3]) * self.config.rot_scale
+        delta_pos = raw_dp * self.config.pos_scale
+        delta_rot = raw_dr * self.config.rot_scale
 
         target_T = state.arm_T.copy()
         target_T[:3, 3] = target_T[:3, 3] + delta_pos
         target_T[:3, :3] = target_T[:3, :3] @ pin.exp3(delta_rot)
-        step_pos = target_T[:3, 3] - state.last_T[:3, 3]
-        step_rot = self._rotation_vector_from_matrix(state.last_T[:3, :3].T @ target_T[:3, :3])
         state.last_T = target_T.copy()
+        target_xyzrpy = self._matrix_to_xyzrpy(target_T)
 
         return {
             "enabled": True,
             "reset": reset_edge,
-            "ee.delta_x": float(step_pos[0]),
-            "ee.delta_y": float(step_pos[1]),
-            "ee.delta_z": float(step_pos[2]),
-            "ee.delta_rx": float(step_rot[0]),
-            "ee.delta_ry": float(step_rot[1]),
-            "ee.delta_rz": float(step_rot[2]),
+            "ee.target_x": float(target_xyzrpy[0]),
+            "ee.target_y": float(target_xyzrpy[1]),
+            "ee.target_z": float(target_xyzrpy[2]),
+            "ee.target_rx": float(target_xyzrpy[3]),
+            "ee.target_ry": float(target_xyzrpy[4]),
+            "ee.target_rz": float(target_xyzrpy[5]),
+            "ee.delta_x": 0.0,
+            "ee.delta_y": 0.0,
+            "ee.delta_z": 0.0,
+            "ee.delta_rx": 0.0,
+            "ee.delta_ry": 0.0,
+            "ee.delta_rz": 0.0,
             "gripper.pos": float(self.config.gripper_open_value if state.gripper_open else self.config.gripper_close_value),
         }
 
@@ -240,26 +259,29 @@ class Quest3VRTeleop(Teleoperator):
 
     @staticmethod
     def _extract_trigger(buttons: dict[str, Any], key: str) -> float:
-        value = buttons.get(key, [0.0])
+        value = buttons.get(key)
+        if value is None:
+            fallback_keys = {
+                "rightTrig": "RTr",
+                "leftTrig": "LTr",
+                "rightGrip": "RG",
+                "leftGrip": "LG",
+            }
+            value = buttons.get(fallback_keys.get(key, ""), [0.0])
         if isinstance(value, (list, tuple)) and value:
             return float(value[0])
         if isinstance(value, (int, float)):
             return float(value)
         return 0.0
 
-    def _extract_pose(self, transforms: dict[str, np.ndarray], key: str) -> np.ndarray | None:
+    def _extract_transform(self, transforms: dict[str, np.ndarray], key: str) -> np.ndarray | None:
         T = transforms.get(key)
         if T is None:
             return None
         arr = np.asarray(T, dtype=np.float64)
         if arr.shape != (4, 4) or np.isnan(arr).any():
             return None
-        arr = self._adjust_frame(arr)
-        x, y, z = arr[0, 3], arr[1, 3], arr[2, 3]
-        roll = math.atan2(arr[2, 1], arr[2, 2])
-        pitch = math.asin(np.clip(-arr[2, 0], -1.0, 1.0))
-        yaw = math.atan2(arr[1, 0], arr[0, 0])
-        return np.array([float(x), float(y), float(z), float(roll), float(pitch), float(yaw)], dtype=np.float64)
+        return self._adjust_frame(arr)
 
     def _adjust_frame(self, T: np.ndarray) -> np.ndarray:
         adj = np.array(
@@ -270,27 +292,71 @@ class Quest3VRTeleop(Teleoperator):
         return adj @ T @ r_adj
 
     @staticmethod
-    def _ema(raw: np.ndarray, prev: np.ndarray | None, alpha: float) -> np.ndarray:
+    def _smooth_transform(raw: np.ndarray, prev: np.ndarray | None, alpha: float) -> np.ndarray:
         if prev is None:
             return raw.copy()
-        return alpha * raw + (1.0 - alpha) * prev
+        out = raw.copy()
+        out[:3, 3] = alpha * raw[:3, 3] + (1.0 - alpha) * prev[:3, 3]
+        rot_delta = pin.log3(prev[:3, :3].T @ raw[:3, :3])
+        out[:3, :3] = prev[:3, :3] @ pin.exp3(alpha * rot_delta)
+        return out
 
     def _log_input(self, now: float, buttons: dict[str, Any]) -> None:
         if now - self._last_input_log_t < self.config.log_input_interval_s:
             return
         self._last_input_log_t = now
         logger.info(
-            "[VR_INPUT] B=%s A=%s trig=%.2f",
+            "[VR_INPUT] B=%s A=%s trig=%.2f gripper=%s",
             bool(buttons.get(self.config.enable_button, False)),
             bool(buttons.get(self.config.reset_button, False)),
             self._extract_trigger(buttons, self.config.gripper_button),
+            "open" if self._right.gripper_open else "closed",
         )
 
     def _log_action(self, now: float, action: RobotAction) -> None:
         if now - self._last_action_log_t < self.config.log_action_interval_s:
             return
+        if self.config.log_only_on_enable and not bool(action.get("enabled", False)):
+            return
         self._last_action_log_t = now
-        logger.info("[VR_ACTION] keys=%s", sorted(action.keys()))
+        target_keys = [
+            "ee.target_x",
+            "ee.target_y",
+            "ee.target_z",
+            "ee.target_rx",
+            "ee.target_ry",
+            "ee.target_rz",
+        ]
+        if all(key in action for key in target_keys):
+            target_xyzrpy = np.array([float(action[key]) for key in target_keys], dtype=np.float64)
+            target_T = self._xyzrpy_to_matrix(*target_xyzrpy.tolist())
+            logger.info(
+                "[VR_TRACE] enabled=%s reset=%s gripper=%.3f target_xyzrpy=%s target_T=%s",
+                bool(action.get("enabled", False)),
+                bool(action.get("reset", False)),
+                float(action.get("gripper.pos", 0.0)),
+                np.array2string(target_xyzrpy, precision=5, suppress_small=True),
+                np.array2string(target_T, precision=5, suppress_small=True),
+            )
+            return
+
+        delta_keys = [
+            "ee.delta_x",
+            "ee.delta_y",
+            "ee.delta_z",
+            "ee.delta_rx",
+            "ee.delta_ry",
+            "ee.delta_rz",
+        ]
+        delta = np.array([float(action.get(key, 0.0)) for key in delta_keys], dtype=np.float64)
+        logger.info(
+            "[VR_TRACE] enabled=%s reset=%s gripper=%.3f delta=%s keys=%s",
+            bool(action.get("enabled", False)),
+            bool(action.get("reset", False)),
+            float(action.get("gripper.pos", 0.0)),
+            np.array2string(delta, precision=5, suppress_small=True),
+            sorted(action.keys()),
+        )
 
     def _log_health(self, now: float, message: str) -> None:
         if now - self._last_health_log_t < self.config.log_health_interval_s:
@@ -316,6 +382,20 @@ class Quest3VRTeleop(Teleoperator):
         T[1] = [sa * cb, ca * cc + sa * sb * sc, sa * sb * cc - ca * sc, y]
         T[2] = [-sb, cb * sc, cb * cc, z]
         return T
+
+    @staticmethod
+    def _matrix_to_xyzrpy(T: np.ndarray) -> np.ndarray:
+        return np.array(
+            [
+                float(T[0, 3]),
+                float(T[1, 3]),
+                float(T[2, 3]),
+                float(math.atan2(T[2, 1], T[2, 2])),
+                float(math.asin(np.clip(-T[2, 0], -1.0, 1.0))),
+                float(math.atan2(T[1, 0], T[0, 0])),
+            ],
+            dtype=np.float64,
+        )
 
     @staticmethod
     def _rotation_vector_from_matrix(R: np.ndarray) -> np.ndarray:

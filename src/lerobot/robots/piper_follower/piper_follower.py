@@ -55,6 +55,8 @@ class PiperFollower(Robot):
         self._is_connected = False
         self._last_mode_refresh_t = 0.0
         self._teleop_send_only_mode = False
+        self._last_gripper_target: float | None = None
+        self._last_command_log_t = 0.0
 
         interface_cls, _ = get_piper_sdk()
         self.arm = interface_cls(
@@ -134,6 +136,7 @@ class PiperFollower(Robot):
             raise
 
         logger.info("%s connected.", self)
+        self._last_gripper_target = None
 
     def _use_uncalibrated_passthrough(self) -> bool:
         return not self.is_calibrated and not self.config.require_calibration
@@ -287,6 +290,7 @@ class PiperFollower(Robot):
                 joint_targets = [self._offset_to_target(key, action[key]) for key in joint_keys]
             joint_commands = [unit_to_milli(value) for value in joint_targets]
             self.arm.JointCtrl(*joint_commands)
+            self._log_joint_command(absolute_joint_targets, joint_targets, joint_commands)
             sent_action.update(
                 {key: milli_to_unit(raw) for key, raw in zip(joint_keys, joint_commands, strict=True)}
             )
@@ -294,20 +298,48 @@ class PiperFollower(Robot):
             logger.debug("Ignoring partial Piper joint action. Need all six joint keys to send command.")
 
         if self.config.sync_gripper and "gripper.pos" in action:
-            if absolute_joint_targets or self._use_uncalibrated_passthrough():
+            # Keep gripper in its calibrated mapping space. Absolute joint mode
+            # only applies to arm joints from IK output.
+            if self._use_uncalibrated_passthrough():
                 gripper_target = action["gripper.pos"]
             else:
                 gripper_target = self._offset_to_target("gripper.pos", action["gripper.pos"])
-            gripper_pos_raw = unit_to_milli(gripper_target)
-            self.arm.GripperCtrl(
-                gripper_pos_raw,
-                self.config.gripper_effort_default,
-                self.config.gripper_status_code,
-                0x00,
-            )
-            sent_action["gripper.pos"] = milli_to_unit(gripper_pos_raw)
+            # Avoid re-sending identical gripper targets every control tick.
+            if self._last_gripper_target is None or abs(float(gripper_target) - self._last_gripper_target) > 1e-6:
+                gripper_pos_raw = unit_to_milli(gripper_target)
+                self.arm.GripperCtrl(
+                    gripper_pos_raw,
+                    self.config.gripper_effort_default,
+                    self.config.gripper_status_code,
+                    0x00,
+                )
+                self._last_gripper_target = float(gripper_target)
+                sent_action["gripper.pos"] = milli_to_unit(gripper_pos_raw)
+                logger.info(
+                    "[PIPER_TRACE] gripper target=%.3f raw=%d passthrough=%s",
+                    float(gripper_target),
+                    gripper_pos_raw,
+                    self._use_uncalibrated_passthrough(),
+                )
 
         return sent_action
+
+    def _log_joint_command(
+        self,
+        absolute_joint_targets: bool,
+        joint_targets: list[float],
+        joint_commands: list[int],
+    ) -> None:
+        now = time.monotonic()
+        if now - self._last_command_log_t < 0.5:
+            return
+        self._last_command_log_t = now
+        logger.info(
+            "[PIPER_TRACE] absolute=%s joint_targets_deg=%s joint_commands_milli=%s",
+            absolute_joint_targets,
+            [round(float(v), 3) for v in joint_targets],
+            joint_commands,
+        )
 
     @check_if_not_connected
     def disconnect(self) -> None:
@@ -320,6 +352,7 @@ class PiperFollower(Robot):
                 if cam.is_connected:
                     cam.disconnect()
             self._is_connected = False
+            self._last_gripper_target = None
             logger.info("%s disconnected.", self)
 
 

@@ -26,6 +26,8 @@ class BiQuest3VRTeleop(Quest3VRTeleop):
         super().__init__(config)
         self.config = config
         self._left = ArmRuntime()
+        self._left.arm_T = self._arm_init_T.copy()
+        self._left.last_T = self._arm_init_T.copy()
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -38,11 +40,11 @@ class BiQuest3VRTeleop(Quest3VRTeleop):
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         transforms, buttons = self._reader.get_transformations_and_buttons()
-        right_pose = self._extract_pose(transforms, "r")
-        left_pose = self._extract_pose(transforms, "l")
+        right_T = self._extract_transform(transforms, "r")
+        left_T = self._extract_transform(transforms, "l")
 
         right_action = self._arm_action(
-            pose=right_pose,
+            controller_T=right_T,
             buttons=buttons,
             state=self._right,
             enable_button=self.config.enable_button,
@@ -50,7 +52,7 @@ class BiQuest3VRTeleop(Quest3VRTeleop):
             gripper_button=self.config.gripper_button,
         )
         left_action = self._arm_action(
-            pose=left_pose,
+            controller_T=left_T,
             buttons=buttons,
             state=self._left,
             enable_button=self.config.left_enable_button,

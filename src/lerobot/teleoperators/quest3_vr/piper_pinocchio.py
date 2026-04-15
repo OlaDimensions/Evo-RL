@@ -88,6 +88,9 @@ class PiperPinocchioIKBackend(IKBackend):
             list_of_joints_to_lock=list(self.config.locked_joint_names),
             reference_configuration=np.zeros(self.robot.model.nq),
         )
+        self._full_q_ref = np.zeros(self.robot.model.nq, dtype=np.float64)
+        self._full_joint_slices = self._joint_slices_by_name(self.robot.model)
+        self._reduced_joint_slices = self._joint_slices_by_name(self.reduced_robot.model)
 
         ee_base_T = self._xyzrpy_to_matrix(*self.config.ee_offset_xyzrpy)
         q = self._quaternion_from_matrix(ee_base_T)
@@ -221,17 +224,52 @@ class PiperPinocchioIKBackend(IKBackend):
         return np.zeros(self.reduced_robot.model.nq, dtype=np.float64)
 
     def _has_collision(self, q: np.ndarray) -> bool:
-        # Temporary model assumption: the current standard Piper URDF in this
-        # workspace is a 6-DOF arm without an appended gripper state vector.
-        # So collision FK must use the same nq as the loaded model.
-        pin.forwardKinematics(self.robot.model, self.robot.data, q)
+        q_full = self._to_full_configuration(np.asarray(q, dtype=np.float64))
+        pin.forwardKinematics(self.robot.model, self.robot.data, q_full)
         pin.updateGeometryPlacements(self.robot.model, self.robot.data, self.geom_model, self.geometry_data)
         return bool(pin.computeCollisions(self.geom_model, self.geometry_data, False))
+
+    def _to_full_configuration(self, q_reduced: np.ndarray) -> np.ndarray:
+        """Expand reduced configuration to full model configuration for collision FK."""
+        if q_reduced.shape[0] == self.robot.model.nq:
+            return q_reduced
+        if q_reduced.shape[0] != self.reduced_robot.model.nq:
+            raise ValueError(
+                f"wrong reduced configuration size: expected {self.reduced_robot.model.nq}, got {q_reduced.shape[0]}"
+            )
+
+        q_full = self._full_q_ref.copy()
+        for joint_name, (rq0, rq1) in self._reduced_joint_slices.items():
+            full_slice = self._full_joint_slices.get(joint_name)
+            if full_slice is None:
+                continue
+            fq0, fq1 = full_slice
+            if (fq1 - fq0) != (rq1 - rq0):
+                raise ValueError(
+                    f"joint slice size mismatch for {joint_name}: full={fq1 - fq0}, reduced={rq1 - rq0}"
+                )
+            q_full[fq0:fq1] = q_reduced[rq0:rq1]
+        return q_full
+
+    @staticmethod
+    def _joint_slices_by_name(model: pin.Model) -> dict[str, tuple[int, int]]:
+        slices: dict[str, tuple[int, int]] = {}
+        for joint_id in range(1, model.njoints):
+            joint_name = model.names[joint_id]
+            joint = model.joints[joint_id]
+            if joint.nq <= 0:
+                continue
+            q0 = joint.idx_q
+            q1 = q0 + joint.nq
+            slices[joint_name] = (q0, q1)
+        return slices
 
     @staticmethod
     def _patch_package_uris(urdf_path: Path, package_dir: Path) -> Path:
         text = urdf_path.read_text()
         replacements = {
+            "package://piper_description/meshes/": f"file://{(package_dir / 'meshes').resolve()}/",
+            "package://piper_description/urdf/": f"file://{(package_dir / 'urdf').resolve()}/",
             "package://meshes/": f"file://{(package_dir / 'meshes').resolve()}/",
             "package://urdf/": f"file://{(package_dir / 'urdf').resolve()}/",
         }
