@@ -79,6 +79,14 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .unitree_g1 import UnitreeG1Teleoperator
 
         return UnitreeG1Teleoperator(config)
+    elif config.type == "quest3_vr":
+        from .quest3_vr.quest3_vr import Quest3VRTeleop
+
+        return Quest3VRTeleop(config)
+    elif config.type == "bi_quest3_vr":
+        from .bi_quest3_vr import BiQuest3VRTeleop
+
+        return BiQuest3VRTeleop(config)
     elif config.type == "bi_so_leader":
         from .bi_so_leader import BiSOLeader
 

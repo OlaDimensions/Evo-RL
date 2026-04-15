@@ -403,6 +403,9 @@ def sanity_check_bimanual_piper_pair(robot_cfg, teleop_cfg) -> None:
 
     robot_type = getattr(robot_cfg, "type", None)
     teleop_type = getattr(teleop_cfg, "type", None)
+    # Quest3 VR can drive both single and dual Piper followers via IK pipeline.
+    if teleop_type in {"quest3_vr", "bi_quest3_vr"}:
+        return
     expected_teleop_by_robot = {
         "bi_piper_follower": "bi_piper_leader",
         "bi_piperx_follower": "bi_piperx_leader",

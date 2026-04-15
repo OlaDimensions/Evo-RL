@@ -276,11 +276,12 @@ class PiperFollower(Robot):
         self._refresh_motion_mode_if_needed()
 
         sent_action: dict[str, float] = {}
+        absolute_joint_targets = bool(action.get("__absolute_joint_targets__", False))
 
         joint_keys = PIPER_JOINT_ACTION_KEYS
         has_all_joints = all(key in action for key in joint_keys)
         if has_all_joints:
-            if self._use_uncalibrated_passthrough():
+            if absolute_joint_targets or self._use_uncalibrated_passthrough():
                 joint_targets = [action[key] for key in joint_keys]
             else:
                 joint_targets = [self._offset_to_target(key, action[key]) for key in joint_keys]
@@ -293,7 +294,7 @@ class PiperFollower(Robot):
             logger.debug("Ignoring partial Piper joint action. Need all six joint keys to send command.")
 
         if self.config.sync_gripper and "gripper.pos" in action:
-            if self._use_uncalibrated_passthrough():
+            if absolute_joint_targets or self._use_uncalibrated_passthrough():
                 gripper_target = action["gripper.pos"]
             else:
                 gripper_target = self._offset_to_target("gripper.pos", action["gripper.pos"])

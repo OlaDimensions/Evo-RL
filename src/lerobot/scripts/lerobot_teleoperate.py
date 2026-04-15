@@ -104,6 +104,12 @@ from lerobot.teleoperators import (  # noqa: F401
     so_leader,
     unitree_g1,
 )
+from lerobot.teleoperators.quest3_vr.config_quest3_vr import Quest3VRTeleopConfig  # noqa: F401
+from lerobot.teleoperators.bi_quest3_vr.config_bi_quest3_vr import BiQuest3VRTeleopConfig  # noqa: F401
+from lerobot.teleoperators.quest3_vr.processors import (
+    make_bi_quest3_vr_robot_action_processor_from_config,
+    make_quest3_vr_robot_action_processor_from_config,
+)
 from lerobot.utils.control_utils import sanity_check_bimanual_piper_pair
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
@@ -262,6 +268,10 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    if getattr(cfg.teleop, "type", None) == "quest3_vr":
+        robot_action_processor = make_quest3_vr_robot_action_processor_from_config(cfg.teleop)
+    elif getattr(cfg.teleop, "type", None) == "bi_quest3_vr":
+        robot_action_processor = make_bi_quest3_vr_robot_action_processor_from_config(cfg.teleop)
     should_fetch_obs = _teleop_needs_robot_observation(
         cfg.display_data, teleop_action_processor, robot_action_processor
     )
