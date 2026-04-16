@@ -285,6 +285,45 @@ def test_record_loop_sets_leader_manual_control_during_reset():
     assert teleop.manual_control_calls == [True]
 
 
+def test_record_calls_episode_reset_hooks_after_last_episode(tmp_path):
+    class MockTeleopWithEpisodeReset(MockTeleop):
+        def __init__(self, config):
+            super().__init__(config)
+            self.prepare_episode_reset_calls = 0
+            self.prepare_episode_start_calls = 0
+
+        def prepare_episode_reset(self) -> None:
+            self.prepare_episode_reset_calls += 1
+
+        def prepare_episode_start(self) -> None:
+            self.prepare_episode_start_calls += 1
+
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig(random_values=False, static_values=[0.0, 0.0, 0.0])
+    teleop = MockTeleopWithEpisodeReset(teleop_cfg)
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "record_episode_reset_hook",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        teleop=teleop_cfg,
+        play_sounds=False,
+    )
+
+    with patch("lerobot.scripts.lerobot_record.make_teleoperator_from_config", return_value=teleop):
+        record(cfg)
+
+    assert teleop.prepare_episode_reset_calls == 1
+    assert teleop.prepare_episode_start_calls == 1
+
+
 def test_save_and_load_failure_reset_pose(tmp_path):
     robot = MockRobot(MockRobotConfig(n_motors=2, random_values=False, static_values=[12.5, -3.0]))
     robot.connect()

@@ -53,6 +53,12 @@ def make_quest3_vr_robot_action_processor_from_config(cfg: Quest3VRTeleopConfig)
         dead_zone_rot=cfg.rot_dead,
         async_solve=cfg.async_ik,
         reset_interp_steps=cfg.reset_interp_steps,
+        reset_target=cfg.reset_target,
+        reset_joint_target_degrees=cfg.reset_joint_target_degrees,
+        reset_joint_tolerance_rad=math.radians(cfg.reset_joint_tolerance_deg),
+        reset_settle_ticks=cfg.reset_settle_ticks,
+        reset_timeout_s=cfg.reset_timeout_s,
+        diagnostics_interval_s=cfg.log_diagnostics_interval_s,
     )
     return RobotProcessorPipeline(
         steps=[step],
@@ -80,6 +86,12 @@ def make_bi_quest3_vr_robot_action_processor_from_config(cfg: BiQuest3VRTeleopCo
             gripper_key="gripper.pos",
             async_solve=cfg.async_ik,
             reset_interp_steps=cfg.reset_interp_steps,
+            reset_target=cfg.reset_target,
+            reset_joint_target_degrees=cfg.reset_joint_target_degrees,
+            reset_joint_tolerance_rad=math.radians(cfg.reset_joint_tolerance_deg),
+            reset_settle_ticks=cfg.reset_settle_ticks,
+            reset_timeout_s=cfg.reset_timeout_s,
+            diagnostics_interval_s=cfg.log_diagnostics_interval_s,
         ),
         right_step=EEToJointIKProcessorStep(
             ik_backend=right_backend,
@@ -93,6 +105,12 @@ def make_bi_quest3_vr_robot_action_processor_from_config(cfg: BiQuest3VRTeleopCo
             gripper_key="gripper.pos",
             async_solve=cfg.async_ik,
             reset_interp_steps=cfg.reset_interp_steps,
+            reset_target=cfg.reset_target,
+            reset_joint_target_degrees=cfg.reset_joint_target_degrees,
+            reset_joint_tolerance_rad=math.radians(cfg.reset_joint_tolerance_deg),
+            reset_settle_ticks=cfg.reset_settle_ticks,
+            reset_timeout_s=cfg.reset_timeout_s,
+            diagnostics_interval_s=cfg.log_diagnostics_interval_s,
         ),
     )
     return RobotProcessorPipeline(

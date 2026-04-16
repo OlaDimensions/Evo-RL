@@ -84,6 +84,33 @@ T = TypeVar("T")
 """
 
 
+def _complete_action_values_for_dataset(
+    ds_features: dict[str, Any],
+    values: RobotAction,
+    observation: RobotObservation,
+    previous_values: RobotAction | None = None,
+) -> RobotAction:
+    """Fill action fields required by the dataset without changing robot commands.
+
+    Some teleop processors intentionally emit partial actions on idle ticks so
+    robot.send_action() does not resend stale joint targets. Dataset frames still
+    need every action feature. Prefer the current observation for missing action
+    values, then fall back to the previous stored action if observation lacks it.
+    """
+    completed = dict(values)
+    for key, ft in ds_features.items():
+        if not key.startswith(ACTION) or ft.get("dtype") != "float32" or len(ft.get("shape", ())) != 1:
+            continue
+        for name in ft.get("names", ()):
+            if name in completed:
+                continue
+            if name in observation:
+                completed[name] = observation[name]
+            elif previous_values is not None and name in previous_values:
+                completed[name] = previous_values[name]
+    return completed
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -160,6 +187,7 @@ def record_loop(
     intervention_enabled = intervention_state_machine_enabled and policy is not None and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
+    last_action_values_for_storage: RobotAction | None = None
     teleop_fallback_warned = False
 
     teleop_arm_for_mode_switch: Any | None = None
@@ -385,7 +413,14 @@ def record_loop(
 
         # Write to dataset
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            action_values_for_storage = _complete_action_values_for_dataset(
+                dataset.features,
+                action_values,
+                obs_processed,
+                last_action_values_for_storage,
+            )
+            last_action_values_for_storage = action_values_for_storage
+            action_frame = build_dataset_frame(dataset.features, action_values_for_storage, prefix=ACTION)
             policy_action_frame = build_dataset_frame(
                 dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
             )

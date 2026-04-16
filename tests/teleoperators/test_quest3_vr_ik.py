@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from lerobot.processor.converters import create_transition
+from lerobot.scripts.recording_loop import _complete_action_values_for_dataset
 from lerobot.teleoperators.bi_quest3_vr.bi_quest3_vr import BiQuest3VRTeleop
 from lerobot.teleoperators.bi_quest3_vr.config_bi_quest3_vr import BiQuest3VRTeleopConfig
 from lerobot.teleoperators.quest3_vr.config_quest3_vr import Quest3VRTeleopConfig
@@ -15,6 +16,24 @@ from lerobot.utils.piper_sdk import PIPER_JOINT_ACTION_KEYS
 
 
 QUEST3VR_WS_ROOT = Path("/home/ola/code/quest3VR_ws/src/oculus_reader/oculus_reader")
+
+
+def test_complete_action_values_for_dataset_fills_partial_idle_action_without_mutating_command():
+    features = {
+        "action": {
+            "dtype": "float32",
+            "shape": (3,),
+            "names": ["joint_1.pos", "joint_2.pos", "gripper.pos"],
+        }
+    }
+    command_action = {"gripper.pos": 0.08}
+    observation = {"joint_1.pos": 10.0}
+    previous = {"joint_1.pos": 9.0, "joint_2.pos": 20.0, "gripper.pos": 0.0}
+
+    completed = _complete_action_values_for_dataset(features, command_action, observation, previous)
+
+    assert command_action == {"gripper.pos": 0.08}
+    assert completed == {"joint_1.pos": 10.0, "joint_2.pos": 20.0, "gripper.pos": 0.08}
 
 
 def _load_ws_functions(source_path: Path, names: set[str], extra_globals: dict | None = None) -> dict:
@@ -224,12 +243,19 @@ def test_ee_to_joint_ik_disabled_action_outputs_empty():
     step = EEToJointIKProcessorStep(ik_backend=FakeBackend(), async_solve=False)
     out = step.action({"enabled": False, "reset": False, "gripper.pos": 0.08})
     assert out["gripper.pos"] == pytest.approx(0.08, abs=1e-9)
-    assert out["__absolute_joint_targets__"] is True
+    assert "__absolute_joint_targets__" not in out
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert key not in out
 
 
 def test_ee_to_joint_ik_reset_outputs_interpolated_joint_commands():
     backend = FakeBackend()
-    step = EEToJointIKProcessorStep(ik_backend=backend, async_solve=False, reset_interp_steps=4)
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        reset_interp_steps=4,
+        reset_target="arm_init_ik",
+    )
 
     _ = step.action(
         {
@@ -258,6 +284,143 @@ def test_ee_to_joint_ik_reset_outputs_interpolated_joint_commands():
     assert out4[PIPER_JOINT_ACTION_KEYS[0]] == pytest.approx(np.degrees(0.1), abs=1e-9)
 
 
+def test_ee_to_joint_ik_reset_holds_goal_until_observation_settles():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        reset_interp_steps=2,
+        reset_target="arm_init_ik",
+        reset_joint_tolerance_rad=math.radians(1.0),
+        reset_settle_ticks=2,
+    )
+    reset_action = {"enabled": True, "reset": True, "gripper.pos": 0.08}
+    disabled_action = {"enabled": False, "reset": False, "gripper.pos": 0.08}
+    goal_deg = {key: np.degrees(0.1 * (idx + 1)) for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS)}
+    partial_obs = {key: 0.0 for key in PIPER_JOINT_ACTION_KEYS}
+
+    step._state.last_q = np.zeros(6, dtype=np.float64)
+    _ = step.action(reset_action)
+    _ = step.action(disabled_action)
+    assert step._state.reset_plan == []
+    assert step._state.reset_active is True
+
+    hold = step(create_transition(observation=partial_obs, action=disabled_action))["action"]
+
+    for key, expected in goal_deg.items():
+        assert hold[key] == pytest.approx(expected, abs=1e-9)
+    assert step._state.reset_active is True
+
+    _ = step(create_transition(observation=goal_deg, action=disabled_action))["action"]
+    assert step._state.reset_active is True
+    _ = step(create_transition(observation=goal_deg, action=disabled_action))["action"]
+    assert step._state.reset_active is False
+
+
+def test_ee_to_joint_ik_reset_prefers_captured_initial_observation():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        reset_interp_steps=1,
+        reset_target="initial_observation",
+    )
+    idle_action = {"enabled": False, "reset": False, "gripper.pos": 0.08}
+    reset_action = {"enabled": True, "reset": True, "gripper.pos": 0.08}
+    initial_obs = {key: 12.0 for key in PIPER_JOINT_ACTION_KEYS}
+    current_obs = {key: 30.0 for key in PIPER_JOINT_ACTION_KEYS}
+
+    _ = step(create_transition(observation=initial_obs, action=idle_action))["action"]
+    out = step(create_transition(observation=current_obs, action=reset_action))["action"]
+
+    assert backend.calls == []
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert out[key] == pytest.approx(12.0, abs=1e-9)
+
+
+def test_ee_to_joint_ik_reset_defaults_to_home_q():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(ik_backend=backend, async_solve=False, reset_interp_steps=1)
+    step._state.last_q = np.ones(6, dtype=np.float64)
+
+    out = step.action({"enabled": True, "reset": True, "gripper.pos": 0.08})
+
+    assert backend.calls == []
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert out[key] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_ee_to_joint_ik_reset_supports_configured_joint_degree_target():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        reset_interp_steps=1,
+        reset_target="joint_degrees",
+        reset_joint_target_degrees=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+    )
+    step._state.last_q = np.zeros(6, dtype=np.float64)
+
+    out = step.action({"enabled": True, "reset": True, "gripper.pos": 0.08})
+
+    for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS):
+        assert out[key] == pytest.approx(float(idx + 1), abs=1e-9)
+
+
+def test_ee_to_joint_ik_small_degree_observation_is_not_treated_as_radians():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(ik_backend=backend, async_solve=False)
+    action = {
+        "enabled": True,
+        "reset": False,
+        "ee.delta_x": 0.01,
+        "ee.delta_y": 0.0,
+        "ee.delta_z": 0.0,
+        "ee.delta_rx": 0.0,
+        "ee.delta_ry": 0.0,
+        "ee.delta_rz": 0.0,
+        "gripper.pos": 0.08,
+    }
+    obs_deg = {key: 2.0 for key in PIPER_JOINT_ACTION_KEYS}
+
+    _ = step(create_transition(observation=obs_deg, action=action))["action"]
+
+    assert backend.calls
+    _, q_seed = backend.calls[-1]
+    assert q_seed is not None
+    np.testing.assert_allclose(q_seed, np.deg2rad(np.full(6, 2.0)), atol=1e-9)
+
+
+def test_ee_to_joint_ik_reset_clears_retained_targets_and_async_state():
+    arm_init_T = _raw_quest_T(0.19, 0.0, 0.2)
+    step = EEToJointIKProcessorStep(ik_backend=FakeBackend(), arm_init_T=arm_init_T, async_solve=False)
+    step._state.target_T = _raw_quest_T(0.5, 0.0, 0.0)
+    step._state.last_q = np.ones(6, dtype=np.float64)
+    step._state.initial_q = np.ones(6, dtype=np.float64)
+    step._state.armed = True
+    step._state.reset_plan = [np.ones(6, dtype=np.float64)]
+    step._state.reset_active = True
+    step._state.reset_goal_q = np.ones(6, dtype=np.float64)
+    step._state.reset_settle_count = 1
+    step._state.ik_inflight = True
+    step._state.async_action_ready = {"joint_1.pos": 1.0}
+    generation = step._state.solve_generation
+
+    step.reset()
+
+    np.testing.assert_allclose(step._state.target_T, arm_init_T, atol=1e-12)
+    assert step._state.last_q is None
+    assert step._state.initial_q is None
+    assert step._state.armed is False
+    assert step._state.reset_plan == []
+    assert step._state.reset_active is False
+    assert step._state.reset_goal_q is None
+    assert step._state.reset_settle_count == 0
+    assert step._state.ik_inflight is False
+    assert step._state.async_action_ready is None
+    assert step._state.solve_generation == generation + 1
+
+
 def test_ee_to_joint_ik_async_returns_result_on_following_tick():
     step = EEToJointIKProcessorStep(ik_backend=SlowFakeBackend(), async_solve=True)
     action = {
@@ -273,7 +436,9 @@ def test_ee_to_joint_ik_async_returns_result_on_following_tick():
     }
     first = step.action(action)
     assert first["gripper.pos"] == pytest.approx(0.08, abs=1e-9)
-    assert first["__absolute_joint_targets__"] is True
+    assert "__absolute_joint_targets__" not in first
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert key not in first
     time.sleep(0.04)
     second = step.action(action)
     assert "__absolute_joint_targets__" in second
@@ -297,7 +462,9 @@ def test_ee_to_joint_ik_async_ready_uses_current_gripper_value():
 
     first = step.action(open_action)
     assert first["gripper.pos"] == pytest.approx(0.08, abs=1e-9)
-    assert first["__absolute_joint_targets__"] is True
+    assert "__absolute_joint_targets__" not in first
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert key not in first
     time.sleep(0.04)
     second = step.action(closed_action)
 
@@ -384,6 +551,21 @@ def test_dual_ik_step_preserves_left_right_output_prefixes():
     assert "left___absolute_joint_targets__" in out and "right___absolute_joint_targets__" in out
 
 
+def test_dual_ik_step_reset_clears_both_arms():
+    left = EEToJointIKProcessorStep(ik_backend=FakeBackend(), async_solve=False, input_prefix="left_", output_prefix="left_")
+    right = EEToJointIKProcessorStep(
+        ik_backend=FakeBackend(), async_solve=False, input_prefix="right_", output_prefix="right_"
+    )
+    dual = DualArmEEToJointIKProcessorStep(left_step=left, right_step=right)
+    left._state.last_q = np.ones(6, dtype=np.float64)
+    right._state.last_q = np.ones(6, dtype=np.float64)
+
+    dual.reset()
+
+    assert left._state.last_q is None
+    assert right._state.last_q is None
+
+
 def test_quest3_vr_single_arm_contract_enable_move_release():
     cfg = Quest3VRTeleopConfig()
     teleop = Quest3VRTeleop(cfg)
@@ -405,6 +587,47 @@ def test_quest3_vr_single_arm_contract_enable_move_release():
     assert all(k in a2 for k in ["ee.target_x", "ee.target_y", "ee.target_z", "ee.target_rx", "ee.target_ry", "ee.target_rz"])
     a3 = teleop.get_action()
     assert a3["enabled"] is False
+
+
+def test_quest3_vr_prepare_episode_reset_emits_reset_without_controller_pose():
+    cfg = Quest3VRTeleopConfig()
+    teleop = Quest3VRTeleop(cfg)
+    teleop._is_connected = True
+    teleop._reader = _FakeReader([({}, {"B": False, "A": False, "rightTrig": (0.0,)})])
+    teleop._right.last_T = _raw_quest_T(0.5, 0.0, 0.0)
+    teleop._right.arm_T = teleop._right.last_T.copy()
+
+    teleop.prepare_episode_reset()
+    action = teleop.get_action()
+
+    assert action["enabled"] is False
+    assert action["reset"] is True
+    assert action["gripper.pos"] == pytest.approx(cfg.gripper_reset_value, abs=1e-9)
+    assert teleop._right.pending_episode_reset is False
+    np.testing.assert_allclose(teleop._right.last_T, teleop._arm_init_T, atol=1e-12)
+
+
+def test_quest3_vr_prepare_episode_start_drops_retained_vr_state():
+    cfg = Quest3VRTeleopConfig()
+    teleop = Quest3VRTeleop(cfg)
+    teleop._right.raw_T = _raw_quest_T(0.1, 0.0, 0.0)
+    teleop._right.smooth_T = _raw_quest_T(0.2, 0.0, 0.0)
+    teleop._right.base_T = _raw_quest_T(0.3, 0.0, 0.0)
+    teleop._right.enable_prev = True
+    teleop._right.reset_prev = True
+    teleop._right.trig_prev = True
+    teleop._right.pending_episode_reset = True
+
+    teleop.prepare_episode_start()
+
+    assert teleop._right.raw_T is None
+    assert teleop._right.smooth_T is None
+    assert teleop._right.base_T is None
+    assert teleop._right.enable_prev is False
+    assert teleop._right.reset_prev is False
+    assert teleop._right.trig_prev is False
+    assert teleop._right.pending_episode_reset is False
+    np.testing.assert_allclose(teleop._right.last_T, teleop._arm_init_T, atol=1e-12)
 
 
 def test_quest3_vr_single_arm_toggles_gripper_on_b_trigger_same_sample():

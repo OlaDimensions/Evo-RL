@@ -37,6 +37,14 @@ class BiQuest3VRTeleop(Quest3VRTeleop):
             **{f"right_{k}": v for k, v in base.items()},
         }
 
+    def prepare_episode_reset(self) -> None:
+        self._prepare_arm_episode_reset(self._left)
+        self._prepare_arm_episode_reset(self._right)
+
+    def prepare_episode_start(self) -> None:
+        self._clear_arm_episode_state(self._left)
+        self._clear_arm_episode_state(self._right)
+
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         transforms, buttons = self._reader.get_transformations_and_buttons()

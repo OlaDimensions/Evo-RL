@@ -345,9 +345,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
     if cfg.teleop is not None and cfg.teleop.type == "quest3_vr":
-        robot_action_processor = make_quest3_vr_robot_action_processor_from_config(cfg.teleop)
+        teleop_action_processor = make_quest3_vr_robot_action_processor_from_config(cfg.teleop)
     elif cfg.teleop is not None and cfg.teleop.type == "bi_quest3_vr":
-        robot_action_processor = make_bi_quest3_vr_robot_action_processor_from_config(cfg.teleop)
+        teleop_action_processor = make_bi_quest3_vr_robot_action_processor_from_config(cfg.teleop)
 
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
@@ -507,16 +507,29 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if callable(on_episode_outcome):
                     on_episode_outcome(robot, teleop, episode_success)
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
+                prepare_episode_reset = getattr(teleop, "prepare_episode_reset", None)
+                prepare_episode_start = getattr(teleop, "prepare_episode_start", None)
+                has_episode_reset_hook = callable(prepare_episode_reset)
+
+                # Execute without recording to reset the environment. Quest3-style teleops can request
+                # this after every episode so the next one starts from a clean initial pose.
+                should_reset_between_episodes = (recorded_episodes < cfg.dataset.num_episodes - 1) or events[
+                    "rerecord_episode"
+                ]
+                if not events["stop_recording"] and (should_reset_between_episodes or has_episode_reset_hook):
                     log_say("Reset the environment", cfg.play_sounds)
 
                     # reset g1 robot
                     if robot.name == "unitree_g1":
                         robot.reset()
+
+                    if has_episode_reset_hook:
+                        prepare_episode_reset()
+
+                    reset_time_s = cfg.dataset.reset_time_s
+                    reset_interp_steps = int(getattr(cfg.teleop, "reset_interp_steps", 0) or 0)
+                    if has_episode_reset_hook and reset_interp_steps > 0:
+                        reset_time_s = max(reset_time_s, (reset_interp_steps + 1) / cfg.dataset.fps)
 
                     record_loop(
                         robot=robot,
@@ -526,7 +539,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
+                        control_time_s=reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         policy_sync_executor=policy_sync_executor,
@@ -537,6 +550,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                         communication_retry_interval_s=cfg.communication_retry_interval_s,
                     )
+
+                    if callable(prepare_episode_start):
+                        prepare_episode_start()
+                    if has_episode_reset_hook:
+                        teleop_action_processor.reset()
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)

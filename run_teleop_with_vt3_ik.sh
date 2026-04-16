@@ -44,5 +44,24 @@ _check_stack
 exec env \
   PYTHONPATH="$VT3_SITE:${PYTHONPATH:-}" \
   LD_LIBRARY_PATH="$VT3_ROOT/lib:${LD_LIBRARY_PATH:-}" \
+  lerobot-human-inloop-record  \
+  --robot.type=piper_follower     \
+  --robot.id=my_piper_follower     \
+  --robot.port=can_left     \
+  --robot.require_calibration=false     \
+  --robot.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height": 480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height": 480, "fps": 30, "warmup_s": 2}}'     \
+  --teleop.type=quest3_vr     \
+  --teleop.id=my_vr_leader     \
+  --dataset.repo_id=ruanafan/evo-rl-data-pnp-vr-test     \
+  --dataset.single_task="Pick up the white bottle and insert it into the middle of the tape roll"     \
+  --dataset.num_episodes=2     \
+  --dataset.episode_time_s=30     \
+  --dataset.reset_time_s=5     \
+  --dataset.push_to_hub=false     \
+  --display_data=false
+
+  # lerobot-teleoperate     --robot.type=piper_follower     --robot.port=can_left     --teleop.type=quest3_vr  --fps=30
+
+
   # "$EVO_PY" -m lerobot.scripts.lerobot_teleoperate "$@"
-  lerobot-teleoperate     --robot.type=piper_follower     --robot.port=can_left     --teleop.type=quest3_vr  --fps=30
+  # lerobot-teleoperate     --robot.type=piper_follower     --robot.port=can_left     --teleop.type=quest3_vr  --fps=30

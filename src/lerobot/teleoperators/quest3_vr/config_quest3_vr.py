@@ -37,7 +37,7 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     # Control semantics
 
     # Input conditioning
-    smooth_alpha: float = 0.2
+    smooth_alpha: float = 0.3
     pos_dead: float = 0.01
     rot_dead: float = 0.026
 
@@ -46,13 +46,19 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     rot_scale: float = 0.4
 
     # Gripper control
-    gripper_open_value: float = 80
-    gripper_close_value: float = -67
+    gripper_open_value: float = 100
+    gripper_close_value: float = 0
+    gripper_reset_value: float = 0
     trigger_threshold: float = 0.5
 
     # IK bridge enablement
-    async_ik: bool = True
+    async_ik: bool = False
     reset_interp_steps: int = 25
+    reset_target: str = "home_q"
+    reset_joint_target_degrees: tuple[float, ...] = ()
+    reset_joint_tolerance_deg: float = 6.0
+    reset_settle_ticks: int = 5
+    reset_timeout_s: float = 10.0
     # URDF variant switch:
     # - "with_gripper": use piper_description_with_g assets and lock joint7/joint8 in IK
     # - "no_gripper": use legacy 6-DOF no-gripper assets
@@ -71,6 +77,7 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     safe_hold_on_stale: bool = True
     log_input_interval_s: float = 1.0
     log_action_interval_s: float = 0.5
+    log_diagnostics_interval_s: float = 1
     log_health_interval_s: float = 1.0
     log_only_on_enable: bool = True
 
@@ -100,6 +107,20 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
             raise ValueError("`async_ik` must be true or false.")
         if self.reset_interp_steps < 1:
             raise ValueError("`reset_interp_steps` must be >= 1.")
+        if self.reset_target not in {"home_q", "arm_init_ik", "initial_observation", "joint_degrees"}:
+            raise ValueError(
+                "`reset_target` must be one of: home_q, arm_init_ik, initial_observation, joint_degrees."
+            )
+        if self.reset_joint_target_degrees and len(self.reset_joint_target_degrees) != 6:
+            raise ValueError("`reset_joint_target_degrees` must contain exactly 6 values when set.")
+        if self.reset_target == "joint_degrees" and not self.reset_joint_target_degrees:
+            raise ValueError("`reset_joint_target_degrees` must be set when `reset_target='joint_degrees'`.")
+        if self.reset_joint_tolerance_deg <= 0:
+            raise ValueError("`reset_joint_tolerance_deg` must be > 0.")
+        if self.reset_settle_ticks < 1:
+            raise ValueError("`reset_settle_ticks` must be >= 1.")
+        if self.reset_timeout_s < 0:
+            raise ValueError("`reset_timeout_s` must be >= 0.")
         if not self.piper_urdf_path:
             raise ValueError("`piper_urdf_path` must be set for Quest3 VR IK.")
         if not self.piper_package_dir:
@@ -114,6 +135,8 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
             raise ValueError("`log_input_interval_s` must be >= 0.")
         if self.log_action_interval_s < 0:
             raise ValueError("`log_action_interval_s` must be >= 0.")
+        if self.log_diagnostics_interval_s < 0:
+            raise ValueError("`log_diagnostics_interval_s` must be >= 0.")
         if self.log_health_interval_s < 0:
             raise ValueError("`log_health_interval_s` must be >= 0.")
         if not isinstance(self.log_only_on_enable, bool):
