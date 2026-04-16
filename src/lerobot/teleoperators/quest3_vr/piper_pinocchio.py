@@ -55,7 +55,7 @@ class PiperIKConfig:
     regularization_weight: float = 0.05
     collision_pair_joint_range: tuple[int, int] = (4, 9)
     collision_pair_link_range: tuple[int, int] = (0, 3)
-    jump_threshold_rad: float = math.radians(30.0)
+    jump_threshold_rad: float = math.radians(50.0)
 
 
 class PiperPinocchioIKBackend(IKBackend):
@@ -173,7 +173,7 @@ class PiperPinocchioIKBackend(IKBackend):
 
     def solve(self, target_T: np.ndarray, q_seed: np.ndarray | None = None) -> IKSolveResult:
         with self._lock:
-            warm = self.home_q() if q_seed is None else np.asarray(q_seed, dtype=np.float64)[: self.reduced_robot.model.nq]
+            warm = self._warm_start(q_seed)
             if self._q_prev.size == 0:
                 self._q_prev = warm.copy()
             self.opti.set_initial(self.var_q, warm)
@@ -186,10 +186,6 @@ class PiperPinocchioIKBackend(IKBackend):
                 self.opti.solve_limited()
                 q = np.asarray(self.opti.value(self.var_q), dtype=np.float64)
                 solve_ms = (time.perf_counter() - start_solve) * 1000.0
-                if max(abs(warm - q)) > self.config.jump_threshold_rad:
-                    self._q_prev = self.home_q()
-                else:
-                    self._q_prev = q.copy()
                 start_collision = time.perf_counter()
                 collision_free = not self._has_collision(q)
                 collision_ms = (time.perf_counter() - start_collision) * 1000.0
@@ -197,17 +193,27 @@ class PiperPinocchioIKBackend(IKBackend):
                 stats = self.opti.stats()
                 iter_count = stats.get("iter_count", -1)
                 return_status = stats.get("return_status", "unknown")
-                if not collision_free:
-                    logger.warning("[IK] self-collision detected for Piper solution")
+                rejection_reason = self._solution_rejection_reason(warm, q, collision_free)
                 logger.info(
-                    "[IK] solve_ms=%.2f collision_ms=%.2f total_ms=%.2f iter=%s status=%s collision_free=%s",
+                    "[IK] solve_ms=%.2f collision_ms=%.2f total_ms=%.2f iter=%s status=%s collision_free=%s rejected=%s",
                     solve_ms,
                     collision_ms,
                     total_ms,
                     iter_count,
                     return_status,
                     collision_free,
+                    rejection_reason or "none",
                 )
+                if rejection_reason:
+                    logger.warning("[IK] rejecting Piper solution: %s", rejection_reason)
+                    return IKSolveResult(
+                        q=None,
+                        success=False,
+                        collision_free=collision_free,
+                        solve_ms=solve_ms,
+                        reason=rejection_reason,
+                    )
+                self._q_prev = q.copy()
                 return IKSolveResult(q=q, success=True, collision_free=collision_free, solve_ms=solve_ms)
             except Exception as exc:
                 total_ms = (time.perf_counter() - start_total) * 1000.0
@@ -222,6 +228,54 @@ class PiperPinocchioIKBackend(IKBackend):
 
     def home_q(self) -> np.ndarray:
         return np.zeros(self.reduced_robot.model.nq, dtype=np.float64)
+
+    def set_previous_q(self, q: np.ndarray | None) -> None:
+        with self._lock:
+            if q is None:
+                self._q_prev = np.zeros(0, dtype=np.float64)
+                return
+            q_arr = np.asarray(q, dtype=np.float64)[: self.reduced_robot.model.nq]
+            if self._is_valid_q(q_arr):
+                self._q_prev = q_arr.copy()
+            else:
+                logger.warning("[IK] ignoring invalid previous_q update")
+                self._q_prev = np.zeros(0, dtype=np.float64)
+
+    def clear_previous_q(self) -> None:
+        self.set_previous_q(None)
+
+    def _warm_start(self, q_seed: np.ndarray | None) -> np.ndarray:
+        if q_seed is not None:
+            q = np.asarray(q_seed, dtype=np.float64)[: self.reduced_robot.model.nq]
+            if self._is_valid_q(q):
+                return q
+            logger.warning("[IK] invalid q_seed; falling back to previous/home seed")
+        if self._is_valid_q(self._q_prev):
+            return self._q_prev.copy()
+        return self.home_q()
+
+    def _is_valid_q(self, q: np.ndarray) -> bool:
+        q = np.asarray(q, dtype=np.float64)
+        if q.shape != (self.reduced_robot.model.nq,) or not np.isfinite(q).all():
+            return False
+        return bool(
+            np.all(q >= self.reduced_robot.model.lowerPositionLimit)
+            and np.all(q <= self.reduced_robot.model.upperPositionLimit)
+        )
+
+    def _solution_rejection_reason(self, warm: np.ndarray, q: np.ndarray, collision_free: bool) -> str:
+        warm = np.asarray(warm, dtype=np.float64)
+        q = np.asarray(q, dtype=np.float64)
+        if not self._is_valid_q(q):
+            return "invalid_solution"
+        if warm.shape != q.shape or not np.isfinite(warm).all():
+            return "invalid_warm_start"
+        jump_rad = float(np.max(np.abs(warm - q))) if q.size else 0.0
+        if jump_rad > self.config.jump_threshold_rad:
+            return f"joint_jump_exceeded:{math.degrees(jump_rad):.2f}deg"
+        if not collision_free:
+            return "self_collision"
+        return ""
 
     def _has_collision(self, q: np.ndarray) -> bool:
         q_full = self._to_full_configuration(np.asarray(q, dtype=np.float64))

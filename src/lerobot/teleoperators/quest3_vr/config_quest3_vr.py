@@ -53,6 +53,9 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
 
     # IK bridge enablement
     async_ik: bool = False
+    joint_smooth_alpha: float = 0.35
+    max_joint_step_deg: float = 5.0
+    target_retry_segment_counts: tuple[int, ...] = (2, 4, 8)
     reset_interp_steps: int = 25
     reset_target: str = "home_q"
     reset_joint_target_degrees: tuple[float, ...] = ()
@@ -105,6 +108,14 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
             raise ValueError("`rot_scale` must be > 0.")
         if not isinstance(self.async_ik, bool):
             raise ValueError("`async_ik` must be true or false.")
+        if not (0.0 < self.joint_smooth_alpha <= 1.0):
+            raise ValueError("`joint_smooth_alpha` must be in (0, 1].")
+        if self.max_joint_step_deg < 0:
+            raise ValueError("`max_joint_step_deg` must be >= 0.")
+        if not isinstance(self.target_retry_segment_counts, tuple):
+            raise ValueError("`target_retry_segment_counts` must be a tuple of integers.")
+        if any(count < 2 for count in self.target_retry_segment_counts):
+            raise ValueError("`target_retry_segment_counts` values must be >= 2.")
         if self.reset_interp_steps < 1:
             raise ValueError("`reset_interp_steps` must be >= 1.")
         if self.reset_target not in {"home_q", "arm_init_ik", "initial_observation", "joint_degrees"}:

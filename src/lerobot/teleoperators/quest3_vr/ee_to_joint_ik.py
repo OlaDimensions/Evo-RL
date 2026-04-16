@@ -46,6 +46,7 @@ class EETargetState:
 
     target_T: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64))
     last_q: np.ndarray | None = None
+    last_command_q: np.ndarray | None = None
     initial_q: np.ndarray | None = None
     armed: bool = False
     reset_plan: list[np.ndarray] = field(default_factory=list)
@@ -90,6 +91,9 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
     reset_joint_tolerance_rad: float = math.radians(6.0)
     reset_settle_ticks: int = 5
     reset_timeout_s: float = 10.0
+    joint_smooth_alpha: float = 1.0
+    max_joint_step_rad: float = 0.0
+    target_retry_segment_counts: tuple[int, ...] = (2, 4, 8)
     diagnostics_interval_s: float = 0.5
     _state: EETargetState = field(default_factory=EETargetState, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
@@ -101,6 +105,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
                 target_T=self.arm_init_T.copy(),
                 solve_generation=generation,
             )
+        self._clear_backend_previous_q()
 
     def action(self, action: RobotAction) -> RobotAction:
         if self.ik_backend is None:
@@ -190,7 +195,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
                 return self._idle_action(gripper, reason="async_inflight")
 
         # Synchronous fallback.
-        result = self.ik_backend.solve(target_T, q_seed=q_seed)
+        result = self._solve_target_with_retries(target_T, q_seed=q_seed)
         return self._result_to_action(result, gripper, seed_source)
 
     def _build_reset_plan(self, action: RobotAction) -> None:
@@ -251,6 +256,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             return self._idle_action(float(action.get(self._in(self.gripper_key), 0.0)), reason="reset_missing_goal")
 
         self._state.last_q = q
+        self._state.last_command_q = q.copy()
         gripper = float(action.get(self._in(self.gripper_key), 0.0))
         self._update_reset_completion(phase)
         return self._compose_joint_action(q, gripper)
@@ -299,12 +305,27 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         self._state.reset_settle_count = 0
         if self._state.reset_goal_q is not None:
             self._state.last_q = self._state.reset_goal_q.copy()
+            self._state.last_command_q = self._state.reset_goal_q.copy()
+            if reason == "settled":
+                self._set_backend_previous_q(self._state.reset_goal_q)
+            else:
+                self._clear_backend_previous_q()
         logger.info(
             "[IK_DIAG] reset_done reason=%s error_deg=%s obs=%s",
             reason,
             "None" if error_rad is None else f"{math.degrees(error_rad):.3f}",
             obs_source,
         )
+
+    def _set_backend_previous_q(self, q: np.ndarray) -> None:
+        setter = getattr(self.ik_backend, "set_previous_q", None)
+        if callable(setter):
+            setter(q)
+
+    def _clear_backend_previous_q(self) -> None:
+        clearer = getattr(self.ik_backend, "clear_previous_q", None)
+        if callable(clearer):
+            clearer()
 
     def _log_reset_status(self, phase: str, error_rad: float | None, settled: bool, obs_source: str) -> None:
         now = time.monotonic()
@@ -330,7 +351,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         generation: int,
     ) -> None:
         try:
-            result = self.ik_backend.solve(target_T, q_seed=q_seed)
+            result = self._solve_target_with_retries(target_T, q_seed=q_seed)
             action = self._result_to_action(result, gripper, seed_source)
             with self._lock:
                 if generation == self._state.solve_generation:
@@ -354,6 +375,37 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             ready = self._state.async_action_ready
             self._state.async_action_ready = None
             return ready
+
+    def _solve_target_with_retries(self, target_T: np.ndarray, q_seed: np.ndarray) -> IKSolveResult:
+        direct_result = self.ik_backend.solve(target_T, q_seed=q_seed)
+        if direct_result.success and direct_result.q is not None:
+            return direct_result
+
+        segment_counts = tuple(sorted({int(count) for count in self.target_retry_segment_counts if int(count) >= 2}))
+        if not segment_counts:
+            return direct_result
+
+        try:
+            start_T = self.ik_backend.fk(q_seed)
+        except Exception as exc:  # pragma: no cover - defensive against backend-specific FK failures
+            logger.warning("[IK] segmented retry skipped because FK failed: %s", exc)
+            return direct_result
+
+        for segment_count in segment_counts:
+            alpha = 1.0 / float(segment_count)
+            segment_T = self._interpolate_pose(start_T, target_T, alpha)
+            result = self.ik_backend.solve(segment_T, q_seed=q_seed)
+            logger.info(
+                "[IK_DIAG] segmented_retry segments=%d alpha=%.3f success=%s reason=%s",
+                segment_count,
+                alpha,
+                result.success,
+                result.reason,
+            )
+            if result.success and result.q is not None:
+                return result
+
+        return direct_result
 
     def _pick_seed(self) -> tuple[np.ndarray, str]:
         q_seed_from_obs = self._seed_from_observation()
@@ -446,22 +498,58 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
     def _is_in_dead_zone(self, delta_pos: np.ndarray, delta_rot: np.ndarray) -> bool:
         return np.linalg.norm(delta_pos) < self.dead_zone_pos and np.linalg.norm(delta_rot) < self.dead_zone_rot
 
+    @staticmethod
+    def _interpolate_pose(start_T: np.ndarray, target_T: np.ndarray, alpha: float) -> np.ndarray:
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        out = np.asarray(start_T, dtype=np.float64).copy()
+        target_T = np.asarray(target_T, dtype=np.float64)
+        out[:3, 3] = out[:3, 3] + alpha * (target_T[:3, 3] - out[:3, 3])
+        rot_delta = pin.log3(out[:3, :3].T @ target_T[:3, :3])
+        out[:3, :3] = out[:3, :3] @ pin.exp3(alpha * rot_delta)
+        return out
+
     def _result_to_action(self, result: IKSolveResult, gripper: float, seed_source: str) -> RobotAction:
         if result.q is None or not result.success:
             logger.warning("[IK] solve failed; skipping command this tick (reason=%s)", result.reason)
             return self._idle_action(gripper)
-        self._state.last_q = np.asarray(result.q, dtype=np.float64)
-        q_deg = np.rad2deg(self._state.last_q[: len(PIPER_JOINT_ACTION_KEYS)])
+        raw_q = np.asarray(result.q, dtype=np.float64)
+        prev_command_q = self._state.last_command_q
+        command_q = self._smooth_joint_solution(raw_q)
+        self._state.last_q = command_q.copy()
+        self._state.last_command_q = command_q.copy()
+        raw_q_deg = np.rad2deg(raw_q[: len(PIPER_JOINT_ACTION_KEYS)])
+        command_q_deg = np.rad2deg(command_q[: len(PIPER_JOINT_ACTION_KEYS)])
+        max_step_rad = 0.0 if prev_command_q is None else float(np.max(np.abs(command_q - prev_command_q)))
         logger.info(
-            "[IK_TRACE] solve_ms=%.2f collision_free=%s seed=%s q_rad=%s q_deg=%s gripper=%.3f",
+            "[IK_TRACE] solve_ms=%.2f collision_free=%s seed=%s raw_q_deg=%s command_q_deg=%s "
+            "joint_smooth_alpha=%.3f max_joint_step_deg=%.3f gripper=%.3f",
             result.solve_ms,
             result.collision_free,
             seed_source,
-            np.array2string(self._state.last_q, precision=5, suppress_small=True),
-            np.array2string(q_deg, precision=3, suppress_small=True),
+            np.array2string(raw_q_deg, precision=3, suppress_small=True),
+            np.array2string(command_q_deg, precision=3, suppress_small=True),
+            self.joint_smooth_alpha,
+            math.degrees(max_step_rad),
             gripper,
         )
-        return self._compose_joint_action(self._state.last_q, gripper)
+        return self._compose_joint_action(command_q, gripper)
+
+    def _smooth_joint_solution(self, raw_q: np.ndarray) -> np.ndarray:
+        raw_q = np.asarray(raw_q, dtype=np.float64)
+        prev_q = self._state.last_command_q
+        if prev_q is None or prev_q.shape != raw_q.shape:
+            return raw_q.copy()
+
+        alpha = float(np.clip(self.joint_smooth_alpha, 0.0, 1.0))
+        if alpha < 1.0:
+            command_q = (1.0 - alpha) * prev_q + alpha * raw_q
+        else:
+            command_q = raw_q.copy()
+
+        max_step = float(self.max_joint_step_rad)
+        if max_step > 0.0:
+            command_q = prev_q + np.clip(command_q - prev_q, -max_step, max_step)
+        return command_q
 
     def _compose_joint_action(self, q: np.ndarray, gripper: float) -> RobotAction:
         # Pinocchio/CasADi IK solutions are in radians, while Piper SDK joint

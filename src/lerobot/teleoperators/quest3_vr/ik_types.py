@@ -49,6 +49,12 @@ class IKBackend(abc.ABC):
     def home_q(self) -> np.ndarray:
         raise NotImplementedError
 
+    def set_previous_q(self, q: np.ndarray | None) -> None:
+        return
+
+    def clear_previous_q(self) -> None:
+        return
+
     def clip(self, q: np.ndarray) -> np.ndarray:
         return q
 

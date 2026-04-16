@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from threading import Lock
 
 from lerobot.processor.converters import create_transition
 from lerobot.scripts.recording_loop import _complete_action_values_for_dataset
@@ -91,9 +93,16 @@ def test_piper_pinocchio_ik_solve_returns_valid_solution():
 class FakeBackend:
     def __init__(self):
         self.calls = []
+        self.previous_q = None
 
     def home_q(self):
         return np.zeros(6, dtype=np.float64)
+
+    def set_previous_q(self, q):
+        self.previous_q = None if q is None else np.asarray(q, dtype=np.float64).copy()
+
+    def clear_previous_q(self):
+        self.previous_q = None
 
     def solve(self, target_T, q_seed=None):
         self.calls.append((target_T.copy(), None if q_seed is None else q_seed.copy()))
@@ -108,6 +117,95 @@ class FakeBackend:
                 "reason": None,
             },
         )()
+
+
+class SegmentedRetryBackend(FakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.fk_calls = []
+
+    def fk(self, q):
+        self.fk_calls.append(np.asarray(q, dtype=np.float64).copy())
+        return np.eye(4, dtype=np.float64)
+
+    def solve(self, target_T, q_seed=None):
+        self.calls.append((target_T.copy(), None if q_seed is None else q_seed.copy()))
+        success = float(target_T[0, 3]) <= 0.51
+        return type(
+            "Result",
+            (),
+            {
+                "q": np.full(6, 0.2, dtype=np.float64) if success else None,
+                "success": success,
+                "collision_free": success,
+                "solve_ms": 1.0,
+                "reason": "" if success else "target_too_far",
+            },
+        )()
+
+
+def _piper_backend_without_solver(nq=6):
+    from lerobot.teleoperators.quest3_vr.piper_pinocchio import PiperPinocchioIKBackend
+
+    backend = PiperPinocchioIKBackend.__new__(PiperPinocchioIKBackend)
+    backend.config = SimpleNamespace(jump_threshold_rad=math.radians(30.0))
+    backend._lock = Lock()
+    backend._q_prev = np.zeros(0, dtype=np.float64)
+    backend.reduced_robot = SimpleNamespace(
+        model=SimpleNamespace(
+            nq=nq,
+            lowerPositionLimit=-np.ones(nq, dtype=np.float64),
+            upperPositionLimit=np.ones(nq, dtype=np.float64),
+        )
+    )
+    return backend
+
+
+def test_piper_backend_warm_start_falls_back_to_valid_previous_q_when_seed_missing():
+    backend = _piper_backend_without_solver()
+    previous_q = np.array([0.1, -0.2, 0.3, -0.4, 0.5, -0.6], dtype=np.float64)
+
+    backend.set_previous_q(previous_q)
+
+    np.testing.assert_allclose(backend._warm_start(None), previous_q, atol=1e-12)
+
+
+def test_piper_backend_warm_start_rejects_invalid_previous_q():
+    backend = _piper_backend_without_solver()
+    backend._q_prev = np.array([0.1, np.nan, 0.3, 0.4, 0.5, 0.6], dtype=np.float64)
+
+    np.testing.assert_allclose(backend._warm_start(None), np.zeros(6, dtype=np.float64), atol=1e-12)
+
+
+def test_piper_backend_rejects_large_joint_jump_solution():
+    backend = _piper_backend_without_solver()
+    warm = np.zeros(6, dtype=np.float64)
+    q = np.zeros(6, dtype=np.float64)
+    q[2] = math.radians(45.0)
+
+    reason = backend._solution_rejection_reason(warm, q, collision_free=True)
+
+    assert reason.startswith("joint_jump_exceeded:")
+
+
+def test_piper_backend_rejects_self_collision_solution():
+    backend = _piper_backend_without_solver()
+    warm = np.zeros(6, dtype=np.float64)
+    q = np.zeros(6, dtype=np.float64)
+
+    reason = backend._solution_rejection_reason(warm, q, collision_free=False)
+
+    assert reason == "self_collision"
+
+
+def test_piper_backend_accepts_valid_collision_free_solution():
+    backend = _piper_backend_without_solver()
+    warm = np.zeros(6, dtype=np.float64)
+    q = np.full(6, math.radians(3.0), dtype=np.float64)
+
+    reason = backend._solution_rejection_reason(warm, q, collision_free=True)
+
+    assert reason == ""
 
 
 class SlowFakeBackend(FakeBackend):
@@ -239,6 +337,69 @@ def test_ee_to_joint_ik_processor_math_flow():
     assert out["__absolute_joint_targets__"] is True
 
 
+def test_ee_to_joint_ik_smooths_joint_solution_before_commanding():
+    backend = FakeBackend()
+    max_step_rad = math.radians(3.0)
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        joint_smooth_alpha=0.5,
+        max_joint_step_rad=max_step_rad,
+    )
+    step._state.last_command_q = np.zeros(6, dtype=np.float64)
+
+    out = step.action(
+        {
+            "enabled": True,
+            "reset": False,
+            "ee.delta_x": 0.10,
+            "ee.delta_y": 0.00,
+            "ee.delta_z": 0.00,
+            "ee.delta_rx": 0.00,
+            "ee.delta_ry": 0.00,
+            "ee.delta_rz": 0.00,
+            "gripper.pos": 0.08,
+        }
+    )
+
+    raw_q = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float64)
+    expected_q = np.clip(0.5 * raw_q, -max_step_rad, max_step_rad)
+    for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS):
+        assert out[key] == pytest.approx(math.degrees(expected_q[idx]), abs=1e-9)
+    np.testing.assert_allclose(step._state.last_command_q, expected_q, atol=1e-12)
+
+
+def test_ee_to_joint_ik_retries_failed_target_with_segmented_step():
+    backend = SegmentedRetryBackend()
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        target_retry_segment_counts=(2,),
+    )
+
+    out = step.action(
+        {
+            "enabled": True,
+            "reset": False,
+            "ee.delta_x": 1.0,
+            "ee.delta_y": 0.0,
+            "ee.delta_z": 0.0,
+            "ee.delta_rx": 0.0,
+            "ee.delta_ry": 0.0,
+            "ee.delta_rz": 0.0,
+            "gripper.pos": 0.08,
+        }
+    )
+
+    assert len(backend.calls) == 2
+    np.testing.assert_allclose(backend.calls[0][0][:3, 3], np.array([1.0, 0.0, 0.0]), atol=1e-12)
+    np.testing.assert_allclose(backend.calls[1][0][:3, 3], np.array([0.5, 0.0, 0.0]), atol=1e-12)
+    assert backend.fk_calls
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert out[key] == pytest.approx(math.degrees(0.2), abs=1e-9)
+    assert out["__absolute_joint_targets__"] is True
+
+
 def test_ee_to_joint_ik_disabled_action_outputs_empty():
     step = EEToJointIKProcessorStep(ik_backend=FakeBackend(), async_solve=False)
     out = step.action({"enabled": False, "reset": False, "gripper.pos": 0.08})
@@ -315,6 +476,7 @@ def test_ee_to_joint_ik_reset_holds_goal_until_observation_settles():
     assert step._state.reset_active is True
     _ = step(create_transition(observation=goal_deg, action=disabled_action))["action"]
     assert step._state.reset_active is False
+    np.testing.assert_allclose(backend.previous_q, np.deg2rad(np.fromiter(goal_deg.values(), dtype=np.float64)), atol=1e-9)
 
 
 def test_ee_to_joint_ik_reset_prefers_captured_initial_observation():
@@ -404,6 +566,8 @@ def test_ee_to_joint_ik_reset_clears_retained_targets_and_async_state():
     step._state.reset_settle_count = 1
     step._state.ik_inflight = True
     step._state.async_action_ready = {"joint_1.pos": 1.0}
+    backend = step.ik_backend
+    backend.set_previous_q(np.ones(6, dtype=np.float64))
     generation = step._state.solve_generation
 
     step.reset()
@@ -419,6 +583,7 @@ def test_ee_to_joint_ik_reset_clears_retained_targets_and_async_state():
     assert step._state.ik_inflight is False
     assert step._state.async_action_ready is None
     assert step._state.solve_generation == generation + 1
+    assert backend.previous_q is None
 
 
 def test_ee_to_joint_ik_async_returns_result_on_following_tick():
