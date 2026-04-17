@@ -62,6 +62,7 @@ lerobot-record \
 ```
 """
 
+from copy import copy, deepcopy
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -104,6 +105,10 @@ from lerobot.scripts.recording_hil import (
     PolicySyncDualArmExecutor,
     _capture_policy_runtime_state,  # noqa: F401
     _predict_policy_action_with_acp_inference,  # noqa: F401
+)
+from lerobot.scripts.recording_ee_pose import (
+    PiperEEPoseStorage,
+    replace_low_dim_features_with_piper_ee_pose,
 )
 from lerobot.scripts.recording_loop import record_loop
 from lerobot.teleoperators import (  # noqa: F401
@@ -245,6 +250,8 @@ class RecordConfig:
     communication_retry_timeout_s: float = 2.0
     # Sleep interval between communication retries (seconds).
     communication_retry_interval_s: float = 0.1
+    # Store low-dimensional Piper state/action as SDK end-effector pose feedback instead of joint positions.
+    record_ee_pose: bool = False
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -363,20 +370,35 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             use_videos=cfg.dataset.video,
         ),
     )
+    control_features = deepcopy(dataset_features)
     if cfg.teleop is not None:
         action_names = dataset_features[ACTION]["names"]
         action_names = list(robot.action_features) if action_names is None else list(action_names)
         _ensure_human_inloop_compatible_features(dataset_features, action_feature_names=action_names)
+        _ensure_human_inloop_compatible_features(control_features, action_feature_names=action_names)
     if cfg.enable_collector_policy_id:
         dataset_features["complementary_info.collector_policy_id"] = {
             "dtype": "string",
             "shape": (1,),
             "names": ["collector_policy_id"],
         }
+        control_features["complementary_info.collector_policy_id"] = {
+            "dtype": "string",
+            "shape": (1,),
+            "names": ["collector_policy_id"],
+        }
+
+    if cfg.record_ee_pose:
+        replace_low_dim_features_with_piper_ee_pose(dataset_features, robot)
+        logging.info(
+            "`record_ee_pose=true`: dataset low-dimensional state/action will be stored as Piper SDK "
+            "end-effector feedback pose. Robot control still uses joint actions."
+        )
 
     dataset = None
     listener = None
     policy_sync_executor = None
+    ee_pose_storage = PiperEEPoseStorage(robot) if cfg.record_ee_pose else None
 
     try:
         if cfg.resume:
@@ -409,8 +431,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 vcodec=cfg.dataset.vcodec,
             )
 
-        # Load pretrained policy
-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        # Load pretrained policy. When EE-pose storage is enabled, keep policy inference on the original
+        # joint-space features so the storage schema does not change robot control semantics.
+        policy_ds_meta = dataset.meta
+        if cfg.record_ee_pose:
+            policy_ds_meta = copy(dataset.meta)
+            policy_ds_meta.info = deepcopy(dataset.meta.info)
+            policy_ds_meta.info["features"] = control_features
+
+        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=policy_ds_meta)
         preprocessor = None
         postprocessor = None
         if cfg.acp_inference.enable and cfg.policy is None:
@@ -419,7 +448,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
-                dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+                dataset_stats=rename_stats(policy_ds_meta.stats, cfg.dataset.rename_map),
                 preprocessor_overrides={
                     "device_processor": {"device": cfg.policy.device},
                     "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
@@ -487,6 +516,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     acp_inference=cfg.acp_inference,
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
+                    control_features=control_features if cfg.record_ee_pose else None,
+                    ee_pose_storage=ee_pose_storage,
                 )
 
                 episode_success = None
@@ -549,6 +580,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         acp_inference=cfg.acp_inference,
                         communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                         communication_retry_interval_s=cfg.communication_retry_interval_s,
+                        control_features=control_features if cfg.record_ee_pose else None,
+                        ee_pose_storage=ee_pose_storage,
                     )
 
                     if callable(prepare_episode_start):

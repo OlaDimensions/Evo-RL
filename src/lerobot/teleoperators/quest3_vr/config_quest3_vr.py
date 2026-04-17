@@ -38,17 +38,17 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
 
     # Input conditioning
     smooth_alpha: float = 0.3
-    pos_dead: float = 0.01
+    pos_dead: float = 0.005
     rot_dead: float = 0.026
 
     # Teleop action shaping
-    pos_scale: float = 0.7
-    rot_scale: float = 0.4
+    pos_scale: float = 0.8
+    rot_scale: float = 0.5
 
     # Gripper control
     gripper_open_value: float = 100
     gripper_close_value: float = 0
-    gripper_reset_value: float = 0
+    gripper_reset_value: float = 100
     trigger_threshold: float = 0.5
 
     # IK bridge enablement
@@ -56,7 +56,7 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     joint_smooth_alpha: float = 0.35
     max_joint_step_deg: float = 5.0
     target_retry_segment_counts: tuple[int, ...] = (2, 4, 8)
-    reset_interp_steps: int = 25
+    reset_interp_steps: int = 50
     reset_target: str = "home_q"
     reset_joint_target_degrees: tuple[float, ...] = ()
     reset_joint_tolerance_deg: float = 6.0

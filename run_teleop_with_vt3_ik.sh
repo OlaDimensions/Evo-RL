@@ -41,7 +41,33 @@ fi
 
 _check_stack
 
-rm -rf /home/ola/.cache/huggingface/lerobot/ruanafan/evo-rl-data-pnp-vr-test
+# rm -rf /home/ola/.cache/huggingface/lerobot/ruanafan/evo-rl-data-pnp-vr-test-ee-pose
+
+# exec env \
+#   PYTHONPATH="$VT3_SITE:${PYTHONPATH:-}" \
+#   LD_LIBRARY_PATH="$VT3_ROOT/lib:${LD_LIBRARY_PATH:-}" \
+#   lerobot-human-inloop-record \
+#   --robot.type=bi_piper_follower \
+#   --robot.id=my_bi_piper_follower \
+#   --robot.left_arm_config.port=can_left \
+#   --robot.right_arm_config.port=can_right \
+#   --robot.left_arm_config.require_calibration=false \
+#   --robot.right_arm_config.require_calibration=false \
+#   --robot.left_arm_config.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "152122072280", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}' \
+#   --robot.right_arm_config.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}' \
+#   --teleop.type=bi_quest3_vr \
+#   --teleop.id=my_bi_vr_leader \
+#   --dataset.repo_id=ruanafan/evo-rl-data-pnp-vr-test-ee-pose \
+#   --dataset.single_task="Pick up the white bottle and insert it into the middle of the tape roll" \
+#   --dataset.num_episodes=2 \
+#   --dataset.episode_time_s=60 \
+#   --dataset.reset_time_s=8 \
+#   --dataset.push_to_hub=false \
+#   --display_data=false \
+#   --teleop.ik_pose_error_mode=reject \
+#   --teleop.ik_max_position_error_m=0.08 \
+#   --teleop.ik_max_orientation_error_deg=60 \
+#   --record_ee_pose=true
 
 exec env \
   PYTHONPATH="$VT3_SITE:${PYTHONPATH:-}" \
@@ -57,17 +83,18 @@ exec env \
   --robot.right_arm_config.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}' \
   --teleop.type=bi_quest3_vr \
   --teleop.id=my_bi_vr_leader \
-  --dataset.repo_id=ruanafan/evo-rl-data-pnp-vr-test \
+  --dataset.repo_id=ruanafan/evo-rl-data-pnp-vr-ee-pose-round0-0417-1 \
   --dataset.single_task="Pick up the white bottle and insert it into the middle of the tape roll" \
-  --dataset.num_episodes=2 \
-  --dataset.episode_time_s=100 \
-  --dataset.reset_time_s=5 \
+  --dataset.num_episodes=20 \
+  --dataset.episode_time_s=60 \
+  --dataset.reset_time_s=8 \
   --dataset.push_to_hub=false \
   --display_data=false \
   --teleop.ik_pose_error_mode=reject \
   --teleop.ik_max_position_error_m=0.08 \
   --teleop.ik_max_orientation_error_deg=60 \
-  > teleop_with_vt3_ik.log 2>&1
+  --record_ee_pose=true
+  # > teleop_with_vt3_ik_ee_pose.log 2>&1
   
   # lerobot-human-inloop-record  \  #single
   # --robot.type=piper_follower     \
