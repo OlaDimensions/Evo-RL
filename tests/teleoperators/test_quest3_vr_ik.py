@@ -38,6 +38,16 @@ def test_complete_action_values_for_dataset_fills_partial_idle_action_without_mu
     assert completed == {"joint_1.pos": 10.0, "joint_2.pos": 20.0, "gripper.pos": 0.08}
 
 
+def _piper_backend_classes_or_skip():
+    try:
+        from lerobot.teleoperators.quest3_vr.piper_pinocchio import (
+            PiperIKConfig,
+            PiperPinocchioIKBackend,
+        )
+    except ImportError as exc:
+        pytest.skip(f"Piper Pinocchio IK backend dependencies are unavailable: {exc}")
+    return PiperIKConfig, PiperPinocchioIKBackend
+
 def _load_ws_functions(source_path: Path, names: set[str], extra_globals: dict | None = None) -> dict:
     if not source_path.exists():
         pytest.skip(f"quest3VR_ws source file not found: {source_path}")
@@ -68,7 +78,7 @@ def _action_target_T(action):
 
 @pytest.mark.slow
 def test_piper_pinocchio_ik_solve_returns_valid_solution():
-    from lerobot.teleoperators.quest3_vr.piper_pinocchio import PiperIKConfig, PiperPinocchioIKBackend
+    PiperIKConfig, PiperPinocchioIKBackend = _piper_backend_classes_or_skip()
 
     backend = PiperPinocchioIKBackend(PiperIKConfig())
     q_seed = backend.home_q()
@@ -145,10 +155,16 @@ class SegmentedRetryBackend(FakeBackend):
 
 
 def _piper_backend_without_solver(nq=6):
-    from lerobot.teleoperators.quest3_vr.piper_pinocchio import PiperPinocchioIKBackend
+    _, PiperPinocchioIKBackend = _piper_backend_classes_or_skip()
 
     backend = PiperPinocchioIKBackend.__new__(PiperPinocchioIKBackend)
-    backend.config = SimpleNamespace(jump_threshold_rad=math.radians(30.0))
+    backend.config = SimpleNamespace(
+        jump_threshold_rad=math.radians(30.0),
+        pose_error_mode="log_only",
+        max_position_error_m=0.08,
+        max_orientation_error_rad=math.radians(60.0),
+        pose_error_log_interval_s=0.5,
+    )
     backend._lock = Lock()
     backend._q_prev = np.zeros(0, dtype=np.float64)
     backend.reduced_robot = SimpleNamespace(
@@ -160,6 +176,63 @@ def _piper_backend_without_solver(nq=6):
     )
     return backend
 
+
+def test_piper_backend_computes_pose_error_components():
+    _, PiperPinocchioIKBackend = _piper_backend_classes_or_skip()
+
+    actual_T = np.eye(4, dtype=np.float64)
+    target_T = np.eye(4, dtype=np.float64)
+    target_T[0, 3] = 0.03
+    target_T[:3, :3] = actual_T[:3, :3] @ np.array(
+        [
+            [math.cos(math.radians(20.0)), -math.sin(math.radians(20.0)), 0.0],
+            [math.sin(math.radians(20.0)), math.cos(math.radians(20.0)), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    pos_error, ori_error = PiperPinocchioIKBackend._pose_error(actual_T, target_T)
+
+    assert pos_error == pytest.approx(0.03, abs=1e-12)
+    assert math.degrees(ori_error) == pytest.approx(20.0, abs=1e-9)
+
+
+def test_piper_backend_pose_error_log_only_does_not_reject():
+    backend = _piper_backend_without_solver()
+    backend.config.pose_error_mode = "log_only"
+
+    reason = backend._pose_error_rejection_reason(0.20, math.radians(90.0), pose_error_exceeded=True)
+
+    assert reason == ""
+
+
+def test_piper_backend_pose_error_reject_mode_rejects_exceeded_error():
+    backend = _piper_backend_without_solver()
+    backend.config.pose_error_mode = "reject"
+
+    reason = backend._pose_error_rejection_reason(0.20, math.radians(90.0), pose_error_exceeded=True)
+
+    assert reason.startswith("pose_error_exceeded:pos=0.2000m,ori=90.00deg")
+
+
+def test_piper_backend_pose_error_reject_mode_preserves_existing_reject_priority():
+    backend = _piper_backend_without_solver()
+    backend.config.pose_error_mode = "reject"
+    warm = np.zeros(6, dtype=np.float64)
+    q = np.zeros(6, dtype=np.float64)
+    q[2] = math.radians(45.0)
+
+    existing_reason = backend._solution_rejection_reason(warm, q, collision_free=True)
+    pose_reason = backend._pose_error_rejection_reason(0.20, math.radians(90.0), pose_error_exceeded=True)
+    final_reason = existing_reason or pose_reason
+
+    assert final_reason.startswith("joint_jump_exceeded:")
+
+
+def test_quest3_vr_config_validates_pose_error_mode():
+    with pytest.raises(ValueError, match="ik_pose_error_mode"):
+        Quest3VRTeleopConfig(ik_pose_error_mode="invalid")
 
 def test_piper_backend_warm_start_falls_back_to_valid_previous_q_when_seed_missing():
     backend = _piper_backend_without_solver()

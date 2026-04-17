@@ -32,6 +32,9 @@ class IKSolveResult:
     collision_free: bool
     solve_ms: float
     reason: str = ""
+    position_error_m: float = 0.0
+    orientation_error_rad: float = 0.0
+    pose_error_exceeded: bool = False
 
 
 class IKBackend(abc.ABC):

@@ -56,6 +56,20 @@ class PiperIKConfig:
     collision_pair_joint_range: tuple[int, int] = (4, 9)
     collision_pair_link_range: tuple[int, int] = (0, 3)
     jump_threshold_rad: float = math.radians(50.0)
+    pose_error_mode: str = "log_only"
+    max_position_error_m: float = 0.08
+    max_orientation_error_rad: float = math.radians(60.0)
+    pose_error_log_interval_s: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.pose_error_mode not in {"off", "log_only", "reject"}:
+            raise ValueError("pose_error_mode must be one of: off, log_only, reject.")
+        if self.max_position_error_m <= 0:
+            raise ValueError("max_position_error_m must be > 0.")
+        if self.max_orientation_error_rad <= 0:
+            raise ValueError("max_orientation_error_rad must be > 0.")
+        if self.pose_error_log_interval_s < 0:
+            raise ValueError("pose_error_log_interval_s must be >= 0.")
 
 
 class PiperPinocchioIKBackend(IKBackend):
@@ -72,6 +86,7 @@ class PiperPinocchioIKBackend(IKBackend):
         self.config = config
         self._lock = Lock()
         self._q_prev = np.zeros(0)
+        self._last_pose_error_log_t = 0.0
         self._build_models()
         self._build_solver()
 
@@ -193,9 +208,35 @@ class PiperPinocchioIKBackend(IKBackend):
                 stats = self.opti.stats()
                 iter_count = stats.get("iter_count", -1)
                 return_status = stats.get("return_status", "unknown")
+                position_error_m = 0.0
+                orientation_error_rad = 0.0
+                pose_error_exceeded = False
+                pose_error_check_reason = ""
+                if self.config.pose_error_mode != "off" and self._is_valid_q(q):
+                    try:
+                        position_error_m, orientation_error_rad = self._compute_pose_error(q, target_T)
+                        pose_error_exceeded = self._pose_error_exceeded(
+                            position_error_m, orientation_error_rad
+                        )
+                        self._maybe_log_pose_error(
+                            position_error_m, orientation_error_rad, pose_error_exceeded
+                        )
+                    except Exception as exc:  # pragma: no cover - defensive against backend FK failures
+                        pose_error_check_reason = f"pose_error_check_failed:{exc}"
+                        logger.warning("[IK] failed to compute pose error: %s", exc)
+
                 rejection_reason = self._solution_rejection_reason(warm, q, collision_free)
+                if not rejection_reason:
+                    rejection_reason = self._pose_error_rejection_reason(
+                        position_error_m,
+                        orientation_error_rad,
+                        pose_error_exceeded,
+                        pose_error_check_reason,
+                    )
                 logger.info(
-                    "[IK] solve_ms=%.2f collision_ms=%.2f total_ms=%.2f iter=%s status=%s collision_free=%s rejected=%s",
+                    "[IK] solve_ms=%.2f collision_ms=%.2f total_ms=%.2f iter=%s status=%s "
+                    "collision_free=%s rejected=%s pose_error_mode=%s pos_error_m=%.4f "
+                    "ori_error_deg=%.2f pose_error_exceeded=%s",
                     solve_ms,
                     collision_ms,
                     total_ms,
@@ -203,6 +244,10 @@ class PiperPinocchioIKBackend(IKBackend):
                     return_status,
                     collision_free,
                     rejection_reason or "none",
+                    self.config.pose_error_mode,
+                    position_error_m,
+                    math.degrees(orientation_error_rad),
+                    pose_error_exceeded,
                 )
                 if rejection_reason:
                     logger.warning("[IK] rejecting Piper solution: %s", rejection_reason)
@@ -212,13 +257,84 @@ class PiperPinocchioIKBackend(IKBackend):
                         collision_free=collision_free,
                         solve_ms=solve_ms,
                         reason=rejection_reason,
+                        position_error_m=position_error_m,
+                        orientation_error_rad=orientation_error_rad,
+                        pose_error_exceeded=pose_error_exceeded,
                     )
                 self._q_prev = q.copy()
-                return IKSolveResult(q=q, success=True, collision_free=collision_free, solve_ms=solve_ms)
+                return IKSolveResult(
+                    q=q,
+                    success=True,
+                    collision_free=collision_free,
+                    solve_ms=solve_ms,
+                    position_error_m=position_error_m,
+                    orientation_error_rad=orientation_error_rad,
+                    pose_error_exceeded=pose_error_exceeded,
+                )
             except Exception as exc:
                 total_ms = (time.perf_counter() - start_total) * 1000.0
                 logger.warning("[IK] solve failed after %.2f ms: %s", total_ms, exc)
-                return IKSolveResult(q=None, success=False, collision_free=False, solve_ms=total_ms, reason=str(exc))
+                return IKSolveResult(
+                    q=None, success=False, collision_free=False, solve_ms=total_ms, reason=str(exc)
+                )
+
+    def _compute_pose_error(self, q: np.ndarray, target_T: np.ndarray) -> tuple[float, float]:
+        actual_T = self.fk(q)
+        return self._pose_error(actual_T, target_T)
+
+    def _pose_error_exceeded(self, position_error_m: float, orientation_error_rad: float) -> bool:
+        return (
+            position_error_m > self.config.max_position_error_m
+            or orientation_error_rad > self.config.max_orientation_error_rad
+        )
+
+    def _pose_error_rejection_reason(
+        self,
+        position_error_m: float,
+        orientation_error_rad: float,
+        pose_error_exceeded: bool,
+        pose_error_check_reason: str = "",
+    ) -> str:
+        if self.config.pose_error_mode != "reject":
+            return ""
+        if pose_error_check_reason:
+            return pose_error_check_reason
+        if not pose_error_exceeded:
+            return ""
+        return (
+            f"pose_error_exceeded:pos={position_error_m:.4f}m,"
+            f"ori={math.degrees(orientation_error_rad):.2f}deg"
+        )
+
+    def _maybe_log_pose_error(
+        self,
+        position_error_m: float,
+        orientation_error_rad: float,
+        pose_error_exceeded: bool,
+    ) -> None:
+        interval_s = self.config.pose_error_log_interval_s
+        now = time.monotonic()
+        if interval_s > 0 and now - self._last_pose_error_log_t < interval_s:
+            return
+        self._last_pose_error_log_t = now
+        logger.info(
+            "[IK_DIAG] pose_error mode=%s pos_error_m=%.4f ori_error_deg=%.2f exceeded=%s "
+            "max_pos_m=%.4f max_ori_deg=%.2f",
+            self.config.pose_error_mode,
+            position_error_m,
+            math.degrees(orientation_error_rad),
+            pose_error_exceeded,
+            self.config.max_position_error_m,
+            math.degrees(self.config.max_orientation_error_rad),
+        )
+
+    @staticmethod
+    def _pose_error(actual_T: np.ndarray, target_T: np.ndarray) -> tuple[float, float]:
+        actual_T = np.asarray(actual_T, dtype=np.float64)
+        target_T = np.asarray(target_T, dtype=np.float64)
+        position_error_m = float(np.linalg.norm(actual_T[:3, 3] - target_T[:3, 3]))
+        orientation_error_rad = float(np.linalg.norm(pin.log3(actual_T[:3, :3].T @ target_T[:3, :3])))
+        return position_error_m, orientation_error_rad
 
     def fk(self, q: np.ndarray) -> np.ndarray:
         q = np.asarray(q, dtype=np.float64)

@@ -42,7 +42,7 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     rot_dead: float = 0.026
 
     # Teleop action shaping
-    pos_scale: float = 0.5
+    pos_scale: float = 0.7
     rot_scale: float = 0.4
 
     # Gripper control
@@ -62,6 +62,10 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     reset_joint_tolerance_deg: float = 6.0
     reset_settle_ticks: int = 5
     reset_timeout_s: float = 10.0
+    ik_pose_error_mode: str = "log_only"
+    ik_max_position_error_m: float = 0.08
+    ik_max_orientation_error_deg: float = 60.0
+    ik_pose_error_log_interval_s: float = 0.5
     # URDF variant switch:
     # - "with_gripper": use piper_description_with_g assets and lock joint7/joint8 in IK
     # - "no_gripper": use legacy 6-DOF no-gripper assets
@@ -132,6 +136,14 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
             raise ValueError("`reset_settle_ticks` must be >= 1.")
         if self.reset_timeout_s < 0:
             raise ValueError("`reset_timeout_s` must be >= 0.")
+        if self.ik_pose_error_mode not in {"off", "log_only", "reject"}:
+            raise ValueError("`ik_pose_error_mode` must be one of: off, log_only, reject.")
+        if self.ik_max_position_error_m <= 0:
+            raise ValueError("`ik_max_position_error_m` must be > 0.")
+        if self.ik_max_orientation_error_deg <= 0:
+            raise ValueError("`ik_max_orientation_error_deg` must be > 0.")
+        if self.ik_pose_error_log_interval_s < 0:
+            raise ValueError("`ik_pose_error_log_interval_s` must be >= 0.")
         if not self.piper_urdf_path:
             raise ValueError("`piper_urdf_path` must be set for Quest3 VR IK.")
         if not self.piper_package_dir:

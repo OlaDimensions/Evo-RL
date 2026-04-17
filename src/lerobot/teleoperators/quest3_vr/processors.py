@@ -38,6 +38,10 @@ def _build_ik_cfg(cfg: Quest3VRTeleopConfig) -> PiperIKConfig:
         ee_link_joint_name=cfg.piper_ee_link_joint_name,
         locked_joint_names=cfg.piper_locked_joint_names,
         ee_offset_xyzrpy=cfg.piper_ee_offset_xyzrpy,
+        pose_error_mode=cfg.ik_pose_error_mode,
+        max_position_error_m=cfg.ik_max_position_error_m,
+        max_orientation_error_rad=math.radians(cfg.ik_max_orientation_error_deg),
+        pose_error_log_interval_s=cfg.ik_pose_error_log_interval_s,
     )
 
 
