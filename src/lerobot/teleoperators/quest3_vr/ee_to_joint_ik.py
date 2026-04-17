@@ -196,7 +196,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
 
         # Synchronous fallback.
         result = self._solve_target_with_retries(target_T, q_seed=q_seed)
-        return self._result_to_action(result, gripper, seed_source)
+        return self._result_to_action(result, gripper, seed_source, q_seed=q_seed)
 
     def _build_reset_plan(self, action: RobotAction) -> None:
         self._state.target_T = self.arm_init_T.copy()
@@ -352,7 +352,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
     ) -> None:
         try:
             result = self._solve_target_with_retries(target_T, q_seed=q_seed)
-            action = self._result_to_action(result, gripper, seed_source)
+            action = self._result_to_action(result, gripper, seed_source, q_seed=q_seed)
             with self._lock:
                 if generation == self._state.solve_generation:
                     self._state.async_action_ready = action
@@ -508,21 +508,33 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         out[:3, :3] = out[:3, :3] @ pin.exp3(alpha * rot_delta)
         return out
 
-    def _result_to_action(self, result: IKSolveResult, gripper: float, seed_source: str) -> RobotAction:
+    def _result_to_action(
+        self,
+        result: IKSolveResult,
+        gripper: float,
+        seed_source: str,
+        *,
+        q_seed: np.ndarray | None = None,
+    ) -> RobotAction:
         if result.q is None or not result.success:
             logger.warning("[IK] solve failed; skipping command this tick (reason=%s)", result.reason)
             return self._idle_action(gripper)
         raw_q = np.asarray(result.q, dtype=np.float64)
         prev_command_q = self._state.last_command_q
-        command_q = self._smooth_joint_solution(raw_q)
+        command_q, limit_baseline = self._smooth_joint_solution(raw_q, seed_q=q_seed)
         self._state.last_q = command_q.copy()
         self._state.last_command_q = command_q.copy()
         raw_q_deg = np.rad2deg(raw_q[: len(PIPER_JOINT_ACTION_KEYS)])
         command_q_deg = np.rad2deg(command_q[: len(PIPER_JOINT_ACTION_KEYS)])
-        max_step_rad = 0.0 if prev_command_q is None else float(np.max(np.abs(command_q - prev_command_q)))
+        if limit_baseline is not None and limit_baseline.shape == command_q.shape:
+            max_step_rad = float(np.max(np.abs(command_q - limit_baseline)))
+            limit_baseline_name = "last_command_q" if prev_command_q is not None else "seed_q"
+        else:
+            max_step_rad = 0.0
+            limit_baseline_name = "none"
         logger.info(
             "[IK_TRACE] solve_ms=%.2f collision_free=%s seed=%s raw_q_deg=%s command_q_deg=%s "
-            "joint_smooth_alpha=%.3f max_joint_step_deg=%.3f gripper=%.3f",
+            "joint_smooth_alpha=%.3f max_joint_step_deg=%.3f limit_baseline=%s gripper=%.3f",
             result.solve_ms,
             result.collision_free,
             seed_source,
@@ -530,15 +542,22 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             np.array2string(command_q_deg, precision=3, suppress_small=True),
             self.joint_smooth_alpha,
             math.degrees(max_step_rad),
+            limit_baseline_name,
             gripper,
         )
         return self._compose_joint_action(command_q, gripper)
 
-    def _smooth_joint_solution(self, raw_q: np.ndarray) -> np.ndarray:
+    def _smooth_joint_solution(self, raw_q: np.ndarray, seed_q: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray | None]:
         raw_q = np.asarray(raw_q, dtype=np.float64)
         prev_q = self._state.last_command_q
         if prev_q is None or prev_q.shape != raw_q.shape:
-            return raw_q.copy()
+            if seed_q is None:
+                logger.warning("[IK] no previous command or seed available; first IK solution is not joint-step limited")
+                return raw_q.copy(), None
+            prev_q = np.asarray(seed_q, dtype=np.float64)
+            if prev_q.shape != raw_q.shape or not np.isfinite(prev_q).all():
+                logger.warning("[IK] invalid seed for first IK solution; first IK solution is not joint-step limited")
+                return raw_q.copy(), None
 
         alpha = float(np.clip(self.joint_smooth_alpha, 0.0, 1.0))
         if alpha < 1.0:
@@ -549,7 +568,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         max_step = float(self.max_joint_step_rad)
         if max_step > 0.0:
             command_q = prev_q + np.clip(command_q - prev_q, -max_step, max_step)
-        return command_q
+        return command_q, prev_q.copy()
 
     def _compose_joint_action(self, q: np.ndarray, gripper: float) -> RobotAction:
         # Pinocchio/CasADi IK solutions are in radians, while Piper SDK joint

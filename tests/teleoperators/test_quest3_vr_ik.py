@@ -308,6 +308,21 @@ def _T(x=0.0, y=0.0, z=0.0):
     return T
 
 
+@pytest.mark.parametrize("angle_deg", [179.99, 180.0, 180.01])
+def test_quest3_vr_rotation_vector_preserves_pi_rotation(angle_deg):
+    R = _raw_quest_T(roll=math.radians(angle_deg))[:3, :3]
+
+    rot_vec = Quest3VRTeleop._rotation_vector_from_matrix(R)
+
+    assert math.degrees(float(np.linalg.norm(rot_vec))) == pytest.approx(180.0, abs=0.02)
+
+
+def test_quest3_vr_rotation_vector_rejects_invalid_matrix():
+    rot_vec = Quest3VRTeleop._rotation_vector_from_matrix(np.full((3, 3), np.nan, dtype=np.float64))
+
+    np.testing.assert_allclose(rot_vec, np.zeros(3, dtype=np.float64), atol=0.0)
+
+
 @pytest.mark.parametrize(
     "raw_T",
     [
@@ -439,6 +454,36 @@ def test_ee_to_joint_ik_smooths_joint_solution_before_commanding():
     expected_q = np.clip(0.5 * raw_q, -max_step_rad, max_step_rad)
     for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS):
         assert out[key] == pytest.approx(math.degrees(expected_q[idx]), abs=1e-9)
+    np.testing.assert_allclose(step._state.last_command_q, expected_q, atol=1e-12)
+
+
+def test_ee_to_joint_ik_limits_first_solution_from_seed_before_commanding():
+    backend = FakeBackend()
+    max_step_rad = math.radians(3.0)
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        joint_smooth_alpha=1.0,
+        max_joint_step_rad=max_step_rad,
+    )
+
+    out = step.action(
+        {
+            "enabled": True,
+            "reset": False,
+            "ee.delta_x": 0.10,
+            "ee.delta_y": 0.00,
+            "ee.delta_z": 0.00,
+            "ee.delta_rx": 0.00,
+            "ee.delta_ry": 0.00,
+            "ee.delta_rz": 0.00,
+            "gripper.pos": 0.08,
+        }
+    )
+
+    expected_q = np.full(6, max_step_rad, dtype=np.float64)
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert out[key] == pytest.approx(math.degrees(max_step_rad), abs=1e-9)
     np.testing.assert_allclose(step._state.last_command_q, expected_q, atol=1e-12)
 
 

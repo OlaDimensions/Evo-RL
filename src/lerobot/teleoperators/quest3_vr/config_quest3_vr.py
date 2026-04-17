@@ -38,12 +38,12 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
 
     # Input conditioning
     smooth_alpha: float = 0.3
-    pos_dead: float = 0.005
+    pos_dead: float = 0.008
     rot_dead: float = 0.026
 
     # Teleop action shaping
-    pos_scale: float = 0.8
-    rot_scale: float = 0.5
+    pos_scale: float = 0.7
+    rot_scale: float = 0.4
 
     # Gripper control
     gripper_open_value: float = 100

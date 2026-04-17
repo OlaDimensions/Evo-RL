@@ -42,7 +42,7 @@ from lerobot.teleoperators.piper_leader import (
 )
 from lerobot.scripts.lerobot_teleoperate import teleop_loop
 from lerobot.teleoperators.utils import make_teleoperator_from_config
-from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
+from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS, PIPER_JOINT_ACTION_KEYS
 
 
 class FakeLogLevel:
@@ -362,6 +362,68 @@ def test_piper_require_calibration_false_allows_uncalibrated_control(monkeypatch
         assert sent["gripper.pos"] == 43.0
     finally:
         teleop.disconnect()
+        robot.disconnect()
+
+
+def test_piper_follower_clips_large_absolute_joint_target_from_observation(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    robot = PiperFollower(PiperFollowerConfig(port="can0", max_absolute_joint_step_deg=8.0))
+    robot.calibration = make_identity_calibration()
+    robot.connect(calibrate=False)
+    try:
+        action = {key: 100.0 for key in PIPER_JOINT_ACTION_KEYS}
+        action["__absolute_joint_targets__"] = True
+
+        sent = robot.send_action(action)
+
+        assert robot.arm.last_joint == (19000, 29000, 39000, 49000, 59000, 69000)
+        assert sent["joint_1.pos"] == pytest.approx(19.0, abs=1e-9)
+    finally:
+        robot.disconnect()
+
+
+def test_piper_follower_absolute_joint_safety_uses_last_sent_target(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    robot = PiperFollower(PiperFollowerConfig(port="can0", max_absolute_joint_step_deg=8.0))
+    robot.calibration = make_identity_calibration()
+    robot.connect(calibrate=False)
+    try:
+        first_action = {
+            key: float(11 + 10 * idx)
+            for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS)
+        }
+        first_action["__absolute_joint_targets__"] = True
+        second_action = {
+            key: float(40 + 10 * idx)
+            for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS)
+        }
+        second_action["__absolute_joint_targets__"] = True
+
+        robot.send_action(first_action)
+        sent = robot.send_action(second_action)
+
+        assert robot.arm.last_joint == (19000, 29000, 39000, 49000, 59000, 69000)
+        assert sent["joint_1.pos"] == pytest.approx(19.0, abs=1e-9)
+    finally:
+        robot.disconnect()
+
+
+def test_piper_follower_non_absolute_joint_action_keeps_calibration_mapping(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    robot = PiperFollower(PiperFollowerConfig(port="can0", max_absolute_joint_step_deg=8.0))
+    robot.calibration = make_identity_calibration()
+    robot.connect(calibrate=False)
+    try:
+        action = {key: 100.0 for key in PIPER_JOINT_ACTION_KEYS}
+
+        sent = robot.send_action(action)
+
+        assert robot.arm.last_joint == (100000, 100000, 100000, 100000, 100000, 100000)
+        assert sent["joint_1.pos"] == pytest.approx(100.0, abs=1e-9)
+    finally:
         robot.disconnect()
 
 
@@ -739,6 +801,30 @@ def test_bimanual_piper_follower_action_features_are_available_without_connect(m
     assert action_features["left_gripper.pos"] is float
     assert action_features["right_joint_1.pos"] is float
     assert action_features["right_gripper.pos"] is float
+
+
+def test_bimanual_piper_follower_propagates_absolute_joint_safety_config(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    robot = make_robot_from_config(
+        BiPiperFollowerConfig(
+            left_arm_config=PiperFollowerConfigBase(
+                port="can3",
+                enable_absolute_joint_safety=False,
+                max_absolute_joint_step_deg=3.5,
+            ),
+            right_arm_config=PiperFollowerConfigBase(
+                port="can2",
+                enable_absolute_joint_safety=True,
+                max_absolute_joint_step_deg=12.0,
+            ),
+        )
+    )
+
+    assert robot.left_arm.config.enable_absolute_joint_safety is False
+    assert robot.left_arm.config.max_absolute_joint_step_deg == 3.5
+    assert robot.right_arm.config.enable_absolute_joint_safety is True
+    assert robot.right_arm.config.max_absolute_joint_step_deg == 12.0
 
 
 def test_bimanual_piper_teleop_loop_smoke(monkeypatch):

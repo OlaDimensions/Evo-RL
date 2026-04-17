@@ -576,14 +576,12 @@ class Quest3VRTeleop(Teleoperator):
 
     @staticmethod
     def _rotation_vector_from_matrix(R: np.ndarray) -> np.ndarray:
-        cos_theta = float(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
-        theta = math.acos(cos_theta)
-        if theta < 1e-9:
+        R = np.asarray(R, dtype=np.float64)
+        if R.shape != (3, 3) or not np.isfinite(R).all():
+            logger.warning("[VR_HEALTH] invalid rotation matrix for log3; returning zero rotation")
             return np.zeros(3, dtype=np.float64)
-        sin_theta = math.sin(theta)
-        if abs(sin_theta) < 1e-12:
+        try:
+            return np.asarray(pin.log3(R), dtype=np.float64)
+        except Exception as exc:  # pragma: no cover - defensive against malformed rotations
+            logger.warning("[VR_HEALTH] failed to compute rotation log; returning zero rotation: %s", exc)
             return np.zeros(3, dtype=np.float64)
-        rx = (R[2, 1] - R[1, 2]) / (2.0 * sin_theta)
-        ry = (R[0, 2] - R[2, 0]) / (2.0 * sin_theta)
-        rz = (R[1, 0] - R[0, 1]) / (2.0 * sin_theta)
-        return theta * np.array([rx, ry, rz], dtype=np.float64)
