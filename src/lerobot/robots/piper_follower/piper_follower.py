@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 import time
 from functools import cached_property
 
@@ -56,6 +57,7 @@ class PiperFollower(Robot):
         self._last_mode_refresh_t = 0.0
         self._teleop_send_only_mode = False
         self._last_gripper_target: float | None = None
+        self._last_absolute_joint_targets: list[float] | None = None
         self._last_command_log_t = 0.0
 
         interface_cls, _ = get_piper_sdk()
@@ -137,6 +139,7 @@ class PiperFollower(Robot):
 
         logger.info("%s connected.", self)
         self._last_gripper_target = None
+        self._last_absolute_joint_targets = self._read_absolute_joint_baseline()
 
     def _use_uncalibrated_passthrough(self) -> bool:
         return not self.is_calibrated and not self.config.require_calibration
@@ -221,6 +224,49 @@ class PiperFollower(Robot):
         obs["gripper.pos"] = abs(milli_to_unit(getattr(gripper_state, "grippers_angle", 0)))
         return obs
 
+    def _read_absolute_joint_baseline(self) -> list[float] | None:
+        if self._teleop_send_only_mode:
+            return None
+        try:
+            obs = self._read_raw_observation()
+        except Exception as exc:  # pragma: no cover - defensive against SDK read failures
+            logger.warning("[PIPER_TRACE] failed to read absolute joint safety baseline: %s", exc)
+            return None
+        values = [float(obs[key]) for key in PIPER_JOINT_ACTION_KEYS]
+        if not all(math.isfinite(value) for value in values):
+            logger.warning("[PIPER_TRACE] invalid absolute joint safety baseline: %s", values)
+            return None
+        return values
+
+    def _limit_absolute_joint_targets(self, joint_targets: list[float]) -> list[float]:
+        if not self.config.enable_absolute_joint_safety:
+            return joint_targets
+
+        baseline = self._last_absolute_joint_targets
+        if baseline is None or len(baseline) != len(joint_targets):
+            baseline = self._read_absolute_joint_baseline()
+        if baseline is None or len(baseline) != len(joint_targets):
+            logger.warning("[PIPER_TRACE] sending absolute joint targets without safety baseline")
+            return joint_targets
+
+        max_step = float(self.config.max_absolute_joint_step_deg)
+        limited_targets = []
+        was_limited = False
+        for target, base in zip(joint_targets, baseline, strict=True):
+            delta = float(target) - float(base)
+            limited_delta = min(max(delta, -max_step), max_step)
+            was_limited = was_limited or abs(limited_delta - delta) > 1e-9
+            limited_targets.append(float(base) + limited_delta)
+        if was_limited:
+            logger.warning(
+                "[PIPER_TRACE] clipped absolute joint target step max_step_deg=%.3f baseline=%s requested=%s limited=%s",
+                max_step,
+                [round(float(v), 3) for v in baseline],
+                [round(float(v), 3) for v in joint_targets],
+                [round(float(v), 3) for v in limited_targets],
+            )
+        return limited_targets
+
     def _to_calibration_units(self, angle_deg: float) -> int:
         return int(round(angle_deg * self.config.calibration_scale))
 
@@ -286,14 +332,16 @@ class PiperFollower(Robot):
         if has_all_joints:
             if absolute_joint_targets or self._use_uncalibrated_passthrough():
                 joint_targets = [action[key] for key in joint_keys]
+                if absolute_joint_targets:
+                    joint_targets = self._limit_absolute_joint_targets(joint_targets)
             else:
                 joint_targets = [self._offset_to_target(key, action[key]) for key in joint_keys]
             joint_commands = [unit_to_milli(value) for value in joint_targets]
             self.arm.JointCtrl(*joint_commands)
             self._log_joint_command(absolute_joint_targets, joint_targets, joint_commands)
-            sent_action.update(
-                {key: milli_to_unit(raw) for key, raw in zip(joint_keys, joint_commands, strict=True)}
-            )
+            sent_joint_targets = [milli_to_unit(raw) for raw in joint_commands]
+            self._last_absolute_joint_targets = sent_joint_targets
+            sent_action.update({key: value for key, value in zip(joint_keys, sent_joint_targets, strict=True)})
         elif any(key in action for key in joint_keys):
             logger.debug("Ignoring partial Piper joint action. Need all six joint keys to send command.")
 
@@ -353,6 +401,7 @@ class PiperFollower(Robot):
                     cam.disconnect()
             self._is_connected = False
             self._last_gripper_target = None
+            self._last_absolute_joint_targets = None
             logger.info("%s disconnected.", self)
 
 

@@ -42,7 +42,7 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     rot_dead: float = 0.026
 
     # Teleop action shaping
-    pos_scale: float = 0.7
+    pos_scale: float = 1.0
     rot_scale: float = 0.4
 
     # Gripper control

@@ -46,6 +46,8 @@ class BiPiperFollower(Robot):
         "speed_ratio",
         "high_follow",
         "mode_refresh_interval_s",
+        "enable_absolute_joint_safety",
+        "max_absolute_joint_step_deg",
         "enable_on_connect",
         "enable_timeout_s",
         "calibration_scale",

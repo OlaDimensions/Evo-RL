@@ -39,6 +39,10 @@ class PiperFollowerConfigBase:
     high_follow: bool = True
     mode_refresh_interval_s: float = 1.0
 
+    # Absolute joint target safety. Used for IK outputs that bypass calibration offsets.
+    enable_absolute_joint_safety: bool = True
+    max_absolute_joint_step_deg: float = 8.0
+
     # Arm enable behavior
     enable_on_connect: bool = True
     enable_timeout_s: float = 3.0
@@ -66,6 +70,10 @@ def _validate_piper_follower_config(config: PiperFollowerConfigBase) -> None:
         raise ValueError("`speed_ratio` must be between 0 and 100.")
     if config.mode_refresh_interval_s < 0:
         raise ValueError("`mode_refresh_interval_s` must be >= 0.")
+    if not isinstance(config.enable_absolute_joint_safety, bool):
+        raise ValueError("`enable_absolute_joint_safety` must be true or false.")
+    if config.max_absolute_joint_step_deg < 0:
+        raise ValueError("`max_absolute_joint_step_deg` must be >= 0.")
     if config.enable_timeout_s < 0:
         raise ValueError("`enable_timeout_s` must be >= 0.")
     if config.calibration_scale <= 0:
