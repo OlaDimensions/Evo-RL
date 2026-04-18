@@ -160,6 +160,8 @@ def _piper_backend_without_solver(nq=6):
     backend = PiperPinocchioIKBackend.__new__(PiperPinocchioIKBackend)
     backend.config = SimpleNamespace(
         jump_threshold_rad=math.radians(30.0),
+        enable_branch_stable_ik=True,
+        branch_trust_region_rad=(math.radians(10.0),) * nq,
         pose_error_mode="log_only",
         max_position_error_m=0.08,
         max_orientation_error_rad=math.radians(60.0),
@@ -285,6 +287,47 @@ class SlowFakeBackend(FakeBackend):
     def solve(self, target_T, q_seed=None):
         time.sleep(0.02)
         return super().solve(target_T, q_seed=q_seed)
+
+
+class AdaptiveAlphaBackend(FakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.fk_calls = []
+
+    def fk(self, q):
+        self.fk_calls.append(np.asarray(q, dtype=np.float64).copy())
+        return np.eye(4, dtype=np.float64)
+
+    def solve(self, target_T, q_seed=None):
+        self.calls.append((target_T.copy(), None if q_seed is None else q_seed.copy()))
+        success = float(target_T[0, 3]) <= 0.51
+        return type(
+            "Result",
+            (),
+            {
+                "q": np.full(6, 0.2, dtype=np.float64) if success else None,
+                "success": success,
+                "collision_free": success,
+                "solve_ms": 1.0,
+                "reason": "" if success else "target_too_far",
+            },
+        )()
+
+
+class AlwaysFailBackend(AdaptiveAlphaBackend):
+    def solve(self, target_T, q_seed=None):
+        self.calls.append((target_T.copy(), None if q_seed is None else q_seed.copy()))
+        return type(
+            "Result",
+            (),
+            {
+                "q": None,
+                "success": False,
+                "collision_free": False,
+                "solve_ms": 1.0,
+                "reason": "always_fail",
+            },
+        )()
 
 
 class _FakeReader:
@@ -492,6 +535,7 @@ def test_ee_to_joint_ik_retries_failed_target_with_segmented_step():
     step = EEToJointIKProcessorStep(
         ik_backend=backend,
         async_solve=False,
+        enable_branch_stable_ik=False,
         target_retry_segment_counts=(2,),
     )
 
@@ -516,6 +560,79 @@ def test_ee_to_joint_ik_retries_failed_target_with_segmented_step():
     for key in PIPER_JOINT_ACTION_KEYS:
         assert out[key] == pytest.approx(math.degrees(0.2), abs=1e-9)
     assert out["__absolute_joint_targets__"] is True
+
+
+def test_ee_to_joint_ik_adaptive_alpha_accepts_largest_reachable_target():
+    backend = AdaptiveAlphaBackend()
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        enable_branch_stable_ik=True,
+        branch_target_alphas=(1.0, 0.5, 0.25),
+    )
+
+    out = step.action(
+        {
+            "enabled": True,
+            "reset": False,
+            "ee.delta_x": 1.0,
+            "ee.delta_y": 0.0,
+            "ee.delta_z": 0.0,
+            "ee.delta_rx": 0.0,
+            "ee.delta_ry": 0.0,
+            "ee.delta_rz": 0.0,
+            "gripper.pos": 0.08,
+        }
+    )
+
+    assert len(backend.calls) == 2
+    np.testing.assert_allclose(backend.calls[0][0][:3, 3], np.array([1.0, 0.0, 0.0]), atol=1e-12)
+    np.testing.assert_allclose(backend.calls[1][0][:3, 3], np.array([0.5, 0.0, 0.0]), atol=1e-12)
+    np.testing.assert_allclose(step._state.target_T[:3, 3], np.array([0.5, 0.0, 0.0]), atol=1e-12)
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert out[key] == pytest.approx(math.degrees(0.2), abs=1e-9)
+    assert out["__absolute_joint_targets__"] is True
+
+
+def test_ee_to_joint_ik_does_not_commit_failed_target():
+    backend = AlwaysFailBackend()
+    step = EEToJointIKProcessorStep(
+        ik_backend=backend,
+        async_solve=False,
+        enable_branch_stable_ik=True,
+        branch_target_alphas=(1.0, 0.5),
+    )
+
+    out = step.action(
+        {
+            "enabled": True,
+            "reset": False,
+            "ee.delta_x": 1.0,
+            "ee.delta_y": 0.0,
+            "ee.delta_z": 0.0,
+            "ee.delta_rx": 0.0,
+            "ee.delta_ry": 0.0,
+            "ee.delta_rz": 0.0,
+            "gripper.pos": 0.08,
+        }
+    )
+
+    np.testing.assert_allclose(step._state.target_T, np.eye(4, dtype=np.float64), atol=1e-12)
+    assert out["gripper.pos"] == pytest.approx(0.08, abs=1e-9)
+    assert "__absolute_joint_targets__" not in out
+    for key in PIPER_JOINT_ACTION_KEYS:
+        assert key not in out
+
+
+def test_piper_backend_branch_trust_region_intersects_joint_limits():
+    backend = _piper_backend_without_solver()
+    warm = np.array([0.0, 0.9, -0.9, 0.2, -0.2, 0.0], dtype=np.float64)
+
+    lower, upper = backend._q_bounds_for_warm_start(warm)
+
+    trust = math.radians(10.0)
+    np.testing.assert_allclose(lower, np.maximum(-np.ones(6), warm - trust), atol=1e-12)
+    np.testing.assert_allclose(upper, np.minimum(np.ones(6), warm + trust), atol=1e-12)
 
 
 def test_ee_to_joint_ik_disabled_action_outputs_empty():

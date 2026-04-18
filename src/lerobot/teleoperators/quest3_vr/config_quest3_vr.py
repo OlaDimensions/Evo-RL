@@ -42,7 +42,7 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     rot_dead: float = 0.026
 
     # Teleop action shaping
-    pos_scale: float = 1.0
+    pos_scale: float = 1.5
     rot_scale: float = 0.4
 
     # Gripper control
@@ -56,6 +56,10 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
     joint_smooth_alpha: float = 0.35
     max_joint_step_deg: float = 5.0
     target_retry_segment_counts: tuple[int, ...] = (2, 4, 8)
+    enable_branch_stable_ik: bool = True
+    branch_trust_region_deg: tuple[float, ...] = (25.0, 25.0, 25.0, 35.0, 30.0, 35.0)
+    branch_target_alphas: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
+    commit_accepted_target_only: bool = True
     reset_interp_steps: int = 50
     reset_target: str = "home_q"
     reset_joint_target_degrees: tuple[float, ...] = ()
@@ -120,6 +124,18 @@ class Quest3VRTeleopConfig(TeleoperatorConfig):
             raise ValueError("`target_retry_segment_counts` must be a tuple of integers.")
         if any(count < 2 for count in self.target_retry_segment_counts):
             raise ValueError("`target_retry_segment_counts` values must be >= 2.")
+        if not isinstance(self.enable_branch_stable_ik, bool):
+            raise ValueError("`enable_branch_stable_ik` must be true or false.")
+        if not isinstance(self.branch_trust_region_deg, tuple):
+            raise ValueError("`branch_trust_region_deg` must be a tuple of degrees.")
+        if not self.branch_trust_region_deg or any(value <= 0 for value in self.branch_trust_region_deg):
+            raise ValueError("`branch_trust_region_deg` values must be > 0.")
+        if not isinstance(self.branch_target_alphas, tuple):
+            raise ValueError("`branch_target_alphas` must be a tuple of floats.")
+        if not self.branch_target_alphas or any(value <= 0.0 or value > 1.0 for value in self.branch_target_alphas):
+            raise ValueError("`branch_target_alphas` values must be in (0, 1].")
+        if not isinstance(self.commit_accepted_target_only, bool):
+            raise ValueError("`commit_accepted_target_only` must be true or false.")
         if self.reset_interp_steps < 1:
             raise ValueError("`reset_interp_steps` must be >= 1.")
         if self.reset_target not in {"home_q", "arm_init_ik", "initial_observation", "joint_degrees"}:

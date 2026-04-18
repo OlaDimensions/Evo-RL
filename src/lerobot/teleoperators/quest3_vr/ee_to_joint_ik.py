@@ -67,6 +67,14 @@ class EETargetState:
     last_async_event: str = ""
 
 
+@dataclass
+class TargetSolveResult:
+    result: IKSolveResult
+    accepted_target_T: np.ndarray | None = None
+    target_source: str = "failed"
+    alpha: float = 0.0
+
+
 @ProcessorStepRegistry.register("ee_to_joint_ik")
 @dataclass
 class EEToJointIKProcessorStep(RobotActionProcessorStep):
@@ -94,6 +102,9 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
     joint_smooth_alpha: float = 1.0
     max_joint_step_rad: float = 0.0
     target_retry_segment_counts: tuple[int, ...] = (2, 4, 8)
+    enable_branch_stable_ik: bool = True
+    branch_target_alphas: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
+    commit_accepted_target_only: bool = True
     diagnostics_interval_s: float = 0.5
     _state: EETargetState = field(default_factory=EETargetState, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
@@ -157,15 +168,16 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
                 self._state.armed = True
 
             if abs_target_T is not None:
-                self._state.target_T = self._map_absolute_target(abs_target_T)
+                target_T = self._map_absolute_target(abs_target_T)
             else:
-                self._state.target_T = self._state.target_T.copy()
-                self._state.target_T[:3, 3] = self._state.target_T[:3, 3] + delta_pos
-                self._state.target_T[:3, :3] = self._state.target_T[:3, :3] @ pin.exp3(delta_rot)
+                target_T = self._state.target_T.copy()
+                target_T[:3, 3] = target_T[:3, 3] + delta_pos
+                target_T[:3, :3] = target_T[:3, :3] @ pin.exp3(delta_rot)
+            if not self.commit_accepted_target_only:
+                self._state.target_T = target_T.copy()
 
             q_seed, seed_source = self._pick_seed()
             self._log_seed_source(seed_source)
-            target_T = self._state.target_T.copy()
             self._log_target(target_T, q_seed, seed_source, gripper, abs_target_T is not None)
 
             if self.async_solve:
@@ -195,8 +207,9 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
                 return self._idle_action(gripper, reason="async_inflight")
 
         # Synchronous fallback.
-        result = self._solve_target_with_retries(target_T, q_seed=q_seed)
-        return self._result_to_action(result, gripper, seed_source, q_seed=q_seed)
+        solve_result = self._solve_target_with_retries(target_T, q_seed=q_seed)
+        self._commit_accepted_target(solve_result)
+        return self._result_to_action(solve_result.result, gripper, seed_source, q_seed=q_seed)
 
     def _build_reset_plan(self, action: RobotAction) -> None:
         self._state.target_T = self.arm_init_T.copy()
@@ -351,10 +364,11 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         generation: int,
     ) -> None:
         try:
-            result = self._solve_target_with_retries(target_T, q_seed=q_seed)
-            action = self._result_to_action(result, gripper, seed_source, q_seed=q_seed)
+            solve_result = self._solve_target_with_retries(target_T, q_seed=q_seed)
+            action = self._result_to_action(solve_result.result, gripper, seed_source, q_seed=q_seed)
             with self._lock:
                 if generation == self._state.solve_generation:
+                    self._commit_accepted_target_locked(solve_result)
                     self._state.async_action_ready = action
                     self._log_async_event("worker_ready", generation=generation, seed_source=seed_source)
                 else:
@@ -376,20 +390,23 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             self._state.async_action_ready = None
             return ready
 
-    def _solve_target_with_retries(self, target_T: np.ndarray, q_seed: np.ndarray) -> IKSolveResult:
+    def _solve_target_with_retries(self, target_T: np.ndarray, q_seed: np.ndarray) -> TargetSolveResult:
+        if self.enable_branch_stable_ik:
+            return self._solve_target_with_adaptive_alphas(target_T, q_seed=q_seed)
+
         direct_result = self.ik_backend.solve(target_T, q_seed=q_seed)
         if direct_result.success and direct_result.q is not None:
-            return direct_result
+            return TargetSolveResult(direct_result, accepted_target_T=target_T.copy(), target_source="full", alpha=1.0)
 
         segment_counts = tuple(sorted({int(count) for count in self.target_retry_segment_counts if int(count) >= 2}))
         if not segment_counts:
-            return direct_result
+            return TargetSolveResult(direct_result)
 
         try:
             start_T = self.ik_backend.fk(q_seed)
         except Exception as exc:  # pragma: no cover - defensive against backend-specific FK failures
             logger.warning("[IK] segmented retry skipped because FK failed: %s", exc)
-            return direct_result
+            return TargetSolveResult(direct_result)
 
         for segment_count in segment_counts:
             alpha = 1.0 / float(segment_count)
@@ -403,9 +420,83 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
                 result.reason,
             )
             if result.success and result.q is not None:
-                return result
+                return TargetSolveResult(
+                    result,
+                    accepted_target_T=segment_T.copy(),
+                    target_source="segment",
+                    alpha=alpha,
+                )
 
-        return direct_result
+        return TargetSolveResult(direct_result)
+
+    def _solve_target_with_adaptive_alphas(self, target_T: np.ndarray, q_seed: np.ndarray) -> TargetSolveResult:
+        alphas = self._normalized_branch_target_alphas()
+        result = self.ik_backend.solve(target_T, q_seed=q_seed)
+        logger.info(
+            "[IK_DIAG] branch_target alpha=1.000 success=%s reason=%s",
+            result.success,
+            result.reason,
+        )
+        if result.success and result.q is not None:
+            return TargetSolveResult(result, accepted_target_T=target_T.copy(), target_source="full", alpha=1.0)
+
+        last_result: IKSolveResult = result
+        segment_alphas = tuple(alpha for alpha in alphas if alpha < 1.0)
+        if not segment_alphas:
+            return TargetSolveResult(last_result)
+
+        try:
+            start_T = self.ik_backend.fk(q_seed)
+        except Exception as exc:  # pragma: no cover - defensive against backend-specific FK failures
+            logger.warning("[IK] branch-stable retry skipped because FK failed: %s", exc)
+            return TargetSolveResult(last_result)
+
+        for alpha in segment_alphas:
+            candidate_T = self._interpolate_pose(start_T, target_T, alpha)
+            result = self.ik_backend.solve(candidate_T, q_seed=q_seed)
+            last_result = result
+            logger.info(
+                "[IK_DIAG] branch_target alpha=%.3f success=%s reason=%s",
+                alpha,
+                result.success,
+                result.reason,
+            )
+            if result.success and result.q is not None:
+                return TargetSolveResult(
+                    result,
+                    accepted_target_T=np.asarray(candidate_T, dtype=np.float64).copy(),
+                    target_source="segment",
+                    alpha=alpha,
+                )
+
+        return TargetSolveResult(last_result)
+
+    def _normalized_branch_target_alphas(self) -> tuple[float, ...]:
+        alphas = sorted({float(alpha) for alpha in self.branch_target_alphas if 0.0 < float(alpha) <= 1.0}, reverse=True)
+        if 1.0 not in alphas:
+            alphas.insert(0, 1.0)
+        return tuple(alphas)
+
+    def _commit_accepted_target(self, solve_result: TargetSolveResult) -> None:
+        with self._lock:
+            self._commit_accepted_target_locked(solve_result)
+
+    def _commit_accepted_target_locked(self, solve_result: TargetSolveResult) -> None:
+        if not self.commit_accepted_target_only:
+            return
+        if solve_result.accepted_target_T is None:
+            logger.info(
+                "[IK_DIAG] committed_target=unchanged source=%s reason=%s",
+                solve_result.target_source,
+                solve_result.result.reason,
+            )
+            return
+        self._state.target_T = solve_result.accepted_target_T.copy()
+        logger.info(
+            "[IK_DIAG] committed_target=%s alpha=%.3f",
+            solve_result.target_source,
+            solve_result.alpha,
+        )
 
     def _pick_seed(self) -> tuple[np.ndarray, str]:
         q_seed_from_obs = self._seed_from_observation()

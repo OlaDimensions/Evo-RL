@@ -53,6 +53,15 @@ class PiperIKConfig:
     pos_weight: float = 1.0
     ori_weight: float = 0.2
     regularization_weight: float = 0.05
+    enable_branch_stable_ik: bool = True
+    branch_trust_region_rad: tuple[float, ...] = (
+        math.radians(25.0),
+        math.radians(25.0),
+        math.radians(25.0),
+        math.radians(35.0),
+        math.radians(30.0),
+        math.radians(35.0),
+    )
     collision_pair_joint_range: tuple[int, int] = (4, 9)
     collision_pair_link_range: tuple[int, int] = (0, 3)
     jump_threshold_rad: float = math.radians(50.0)
@@ -70,6 +79,10 @@ class PiperIKConfig:
             raise ValueError("max_orientation_error_rad must be > 0.")
         if self.pose_error_log_interval_s < 0:
             raise ValueError("pose_error_log_interval_s must be >= 0.")
+        if not isinstance(self.enable_branch_stable_ik, bool):
+            raise ValueError("enable_branch_stable_ik must be true or false.")
+        if not self.branch_trust_region_rad or any(value <= 0 for value in self.branch_trust_region_rad):
+            raise ValueError("branch_trust_region_rad values must be > 0.")
 
 
 class PiperPinocchioIKBackend(IKBackend):
@@ -160,6 +173,8 @@ class PiperPinocchioIKBackend(IKBackend):
         self.var_q = self.opti.variable(self.reduced_robot.model.nq)
         self.param_tf = self.opti.parameter(4, 4)
         self.param_qwarm = self.opti.parameter(self.reduced_robot.model.nq)
+        self.param_q_lower = self.opti.parameter(self.reduced_robot.model.nq)
+        self.param_q_upper = self.opti.parameter(self.reduced_robot.model.nq)
 
         error_vec = self.error_fn(self.var_q, self.param_tf)
         pos_error = error_vec[:3]
@@ -171,9 +186,9 @@ class PiperPinocchioIKBackend(IKBackend):
         self.opti.minimize(total_cost)
         self.opti.subject_to(
             self.opti.bounded(
-                self.reduced_robot.model.lowerPositionLimit,
+                self.param_q_lower,
                 self.var_q,
-                self.reduced_robot.model.upperPositionLimit,
+                self.param_q_upper,
             )
         )
         opts = {
@@ -189,11 +204,14 @@ class PiperPinocchioIKBackend(IKBackend):
     def solve(self, target_T: np.ndarray, q_seed: np.ndarray | None = None) -> IKSolveResult:
         with self._lock:
             warm = self._warm_start(q_seed)
+            q_lower, q_upper = self._q_bounds_for_warm_start(warm)
             if self._q_prev.size == 0:
                 self._q_prev = warm.copy()
             self.opti.set_initial(self.var_q, warm)
             self.opti.set_value(self.param_tf, target_T)
             self.opti.set_value(self.param_qwarm, warm)
+            self.opti.set_value(self.param_q_lower, q_lower)
+            self.opti.set_value(self.param_q_upper, q_upper)
 
             start_total = time.perf_counter()
             try:
@@ -369,6 +387,27 @@ class PiperPinocchioIKBackend(IKBackend):
         if self._is_valid_q(self._q_prev):
             return self._q_prev.copy()
         return self.home_q()
+
+    def _q_bounds_for_warm_start(self, warm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        lower = np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64).copy()
+        upper = np.asarray(self.reduced_robot.model.upperPositionLimit, dtype=np.float64).copy()
+        if not self.config.enable_branch_stable_ik:
+            return lower, upper
+
+        trust = self._branch_trust_region()
+        warm = np.asarray(warm, dtype=np.float64)[: self.reduced_robot.model.nq]
+        return np.maximum(lower, warm - trust), np.minimum(upper, warm + trust)
+
+    def _branch_trust_region(self) -> np.ndarray:
+        trust = np.asarray(self.config.branch_trust_region_rad, dtype=np.float64)
+        nq = self.reduced_robot.model.nq
+        if trust.size == 1:
+            return np.full(nq, float(trust[0]), dtype=np.float64)
+        if trust.size != nq:
+            raise ValueError(
+                f"branch_trust_region_rad must contain 1 or {nq} values for this IK model, got {trust.size}."
+            )
+        return trust.copy()
 
     def _is_valid_q(self, q: np.ndarray) -> bool:
         q = np.asarray(q, dtype=np.float64)

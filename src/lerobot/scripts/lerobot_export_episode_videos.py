@@ -199,7 +199,9 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+    dataset_root = args.root / args.repo_id if args.root is not None else None
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=dataset_root)
+    # dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
     if args.image_key not in dataset.features:
         available_camera_like = [k for k in dataset.features if k.startswith("observation.images.")]
         raise KeyError(
