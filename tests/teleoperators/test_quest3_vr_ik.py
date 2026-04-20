@@ -468,6 +468,63 @@ def test_ee_to_joint_ik_processor_math_flow():
     assert out["__absolute_joint_targets__"] is True
 
 
+def test_ee_to_joint_ik_accepts_absolute_xyz_quaternion_target():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(ik_backend=backend, async_solve=False)
+    angle = math.radians(90.0)
+
+    out = step.action(
+        {
+            "enabled": True,
+            "reset": False,
+            "ee.x": 0.12,
+            "ee.y": -0.03,
+            "ee.z": 0.25,
+            "ee.qx": 0.0,
+            "ee.qy": 0.0,
+            "ee.qz": 2.0 * math.sin(angle / 2.0),
+            "ee.qw": 2.0 * math.cos(angle / 2.0),
+            "gripper.pos": 42.0,
+        }
+    )
+
+    assert backend.calls, "IK backend was not called"
+    target_T, _ = backend.calls[-1]
+    expected_R = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(target_T[:3, 3], np.array([0.12, -0.03, 0.25]), atol=1e-12)
+    np.testing.assert_allclose(target_T[:3, :3], expected_R, atol=1e-12)
+    for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS):
+        assert out[key] == pytest.approx(math.degrees(0.1 * (idx + 1)), abs=1e-9)
+    assert out["gripper.pos"] == pytest.approx(42.0, abs=1e-9)
+
+
+def test_ee_to_joint_ik_rejects_zero_quaternion_target():
+    step = EEToJointIKProcessorStep(ik_backend=FakeBackend(), async_solve=False)
+
+    with pytest.raises(ValueError, match="Invalid EE quaternion"):
+        step.action(
+            {
+                "enabled": True,
+                "reset": False,
+                "ee.x": 0.12,
+                "ee.y": -0.03,
+                "ee.z": 0.25,
+                "ee.qx": 0.0,
+                "ee.qy": 0.0,
+                "ee.qz": 0.0,
+                "ee.qw": 0.0,
+                "gripper.pos": 42.0,
+            }
+        )
+
+
 def test_ee_to_joint_ik_smooths_joint_solution_before_commanding():
     backend = FakeBackend()
     max_step_rad = math.radians(3.0)
@@ -949,6 +1006,51 @@ def test_dual_ik_step_preserves_left_right_output_prefixes():
     out = dual(create_transition(observation={}, action=action))["action"]
     assert "left_joint_1.pos" in out and "right_joint_1.pos" in out
     assert "left___absolute_joint_targets__" in out and "right___absolute_joint_targets__" in out
+
+
+def test_dual_ik_step_accepts_prefixed_xyz_quaternion_targets():
+    left_backend = FakeBackend()
+    right_backend = FakeBackend()
+    left = EEToJointIKProcessorStep(
+        ik_backend=left_backend, async_solve=False, input_prefix="left_", output_prefix="left_"
+    )
+    right = EEToJointIKProcessorStep(
+        ik_backend=right_backend, async_solve=False, input_prefix="right_", output_prefix="right_"
+    )
+    dual = DualArmEEToJointIKProcessorStep(left_step=left, right_step=right)
+
+    action = {
+        "left_enabled": True,
+        "left_reset": False,
+        "left_ee.x": 0.10,
+        "left_ee.y": 0.20,
+        "left_ee.z": 0.30,
+        "left_ee.qx": 0.0,
+        "left_ee.qy": 0.0,
+        "left_ee.qz": 0.0,
+        "left_ee.qw": 1.0,
+        "left_gripper.pos": 11.0,
+        "right_enabled": True,
+        "right_reset": False,
+        "right_ee.x": -0.10,
+        "right_ee.y": -0.20,
+        "right_ee.z": 0.40,
+        "right_ee.qx": 0.0,
+        "right_ee.qy": 0.0,
+        "right_ee.qz": 0.0,
+        "right_ee.qw": 1.0,
+        "right_gripper.pos": 22.0,
+    }
+
+    out = dual(create_transition(observation={}, action=action))["action"]
+
+    np.testing.assert_allclose(left_backend.calls[-1][0][:3, 3], np.array([0.10, 0.20, 0.30]), atol=1e-12)
+    np.testing.assert_allclose(
+        right_backend.calls[-1][0][:3, 3], np.array([-0.10, -0.20, 0.40]), atol=1e-12
+    )
+    assert "left_joint_1.pos" in out and "right_joint_1.pos" in out
+    assert out["left_gripper.pos"] == pytest.approx(11.0, abs=1e-9)
+    assert out["right_gripper.pos"] == pytest.approx(22.0, abs=1e-9)
 
 
 def test_dual_ik_step_reset_clears_both_arms():

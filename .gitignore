@@ -178,3 +178,6 @@ outputs/
 *.xml
 *.part
 AGENTS.md
+.mp4
+episode_videos*
+tests/*

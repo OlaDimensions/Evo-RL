@@ -16,6 +16,7 @@
 
 import json
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -38,6 +39,7 @@ from lerobot.scripts.lerobot_record import (
     DatasetRecordConfig,
     PolicySyncDualArmExecutor,
     RecordConfig,
+    _make_policy_action_processor_for_ee_pose,
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
     record,
@@ -45,6 +47,8 @@ from lerobot.scripts.lerobot_record import (
 )
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.teleoperators.bi_quest3_vr.config_bi_quest3_vr import BiQuest3VRTeleopConfig
+from lerobot.teleoperators.quest3_vr.config_quest3_vr import Quest3VRTeleopConfig
 from lerobot.utils.recording_annotations import EPISODE_SUCCESS
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobot, MockRobotConfig
@@ -283,6 +287,323 @@ def test_record_loop_sets_leader_manual_control_during_reset():
             robot.disconnect()
 
     assert teleop.manual_control_calls == [True]
+
+
+def test_record_loop_adapts_policy_ee_action_before_robot_send(tmp_path):
+    class _Dataset:
+        fps = 30
+        features = {
+            "action": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["motor_1.pos"],
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["motor_1.pos"],
+            },
+        }
+
+        def __init__(self):
+            self.frames = []
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+    class _Runtime:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+
+    class _Policy(_Runtime):
+        config = type("Config", (), {"device": "cpu", "use_amp": False})()
+
+    class _PolicyActionAdapter:
+        def __init__(self):
+            self.calls = []
+            self.reset_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+
+        def __call__(self, payload):
+            action, observation = payload
+            self.calls.append((action, observation))
+            return {"motor_1.pos": 7.0}
+
+    robot = MockRobot(
+        MockRobotConfig(
+            n_motors=1,
+            random_values=False,
+            static_values=[1.0],
+            calibration_dir=tmp_path / "calibration",
+        )
+    )
+    robot.connect()
+    robot.send_action = MagicMock(wraps=robot.send_action)
+    dataset = _Dataset()
+    policy = _Policy()
+    preprocessor = _Runtime()
+    postprocessor = _Runtime()
+    policy_action_processor = _PolicyActionAdapter()
+    policy_features = {
+        "action": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"],
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["motor_1.pos"],
+        },
+    }
+
+    try:
+        with patch(
+            "lerobot.scripts.recording_loop._predict_policy_action_with_acp_inference",
+            return_value=torch.tensor([[0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 42.0]], dtype=torch.float32),
+        ):
+            record_loop(
+                robot=robot,
+                events={
+                    "exit_early": False,
+                    "rerecord_episode": False,
+                    "stop_recording": False,
+                    "toggle_intervention": False,
+                    "episode_outcome": None,
+                },
+                fps=30,
+                teleop_action_processor=lambda x: x[0],
+                robot_action_processor=lambda x: x[0],
+                robot_observation_processor=lambda x: x,
+                dataset=dataset,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                policy_action_processor=policy_action_processor,
+                policy_features=policy_features,
+                control_time_s=0.001,
+            )
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+    raw_policy_action, _ = policy_action_processor.calls[0]
+    assert raw_policy_action["ee.x"] == pytest.approx(0.1)
+    assert raw_policy_action["ee.qw"] == pytest.approx(1.0)
+    robot.send_action.assert_called()
+    assert robot.send_action.call_args.args[0] == {"motor_1.pos": 7.0}
+    assert dataset.frames
+    assert policy_action_processor.reset_calls == 1
+
+
+def test_record_loop_disables_stationary_bimanual_ee_quat_policy_arm(tmp_path):
+    class _Dataset:
+        fps = 30
+        features = {
+            "action": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["motor_1.pos"],
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["motor_1.pos"],
+            },
+        }
+
+        def __init__(self):
+            self.frames = []
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+    class _Runtime:
+        def reset(self):
+            pass
+
+    class _Policy(_Runtime):
+        config = type("Config", (), {"device": "cpu", "use_amp": False})()
+
+    class _PolicyActionAdapter:
+        def __init__(self):
+            self.calls = []
+
+        def reset(self):
+            pass
+
+        def __call__(self, payload):
+            action, observation = payload
+            self.calls.append((dict(action), dict(observation)))
+            return {"motor_1.pos": float(len(self.calls))}
+
+    action_names = [
+        "left_ee.x",
+        "left_ee.y",
+        "left_ee.z",
+        "left_ee.qx",
+        "left_ee.qy",
+        "left_ee.qz",
+        "left_ee.qw",
+        "left_gripper.pos",
+        "right_ee.x",
+        "right_ee.y",
+        "right_ee.z",
+        "right_ee.qx",
+        "right_ee.qy",
+        "right_ee.qz",
+        "right_ee.qw",
+        "right_gripper.pos",
+    ]
+    first = [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 42.0, 0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0, 24.0]
+    right_only = [
+        0.1,
+        0.2,
+        0.3,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        42.0,
+        0.41,
+        0.5,
+        0.6,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        24.0,
+    ]
+    left_only = [
+        0.11,
+        0.2,
+        0.3,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        42.0,
+        0.41,
+        0.5,
+        0.6,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        24.0,
+    ]
+    policy_outputs = deque(
+        [
+            torch.tensor([first], dtype=torch.float32),
+            torch.tensor([right_only], dtype=torch.float32),
+            torch.tensor([left_only], dtype=torch.float32),
+        ]
+    )
+
+    robot = MockRobot(
+        MockRobotConfig(
+            n_motors=1,
+            random_values=False,
+            static_values=[1.0],
+            calibration_dir=tmp_path / "calibration",
+        )
+    )
+    robot.connect()
+    dataset = _Dataset()
+    policy_action_processor = _PolicyActionAdapter()
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "toggle_intervention": False,
+        "episode_outcome": None,
+    }
+
+    def _next_policy_action(**kwargs):
+        action = policy_outputs.popleft()
+        if not policy_outputs:
+            events["exit_early"] = True
+        return action
+
+    try:
+        with (
+            patch(
+                "lerobot.scripts.recording_loop._predict_policy_action_with_acp_inference",
+                side_effect=_next_policy_action,
+            ),
+            patch("lerobot.scripts.recording_loop.precise_sleep", lambda _: None),
+        ):
+            record_loop(
+                robot=robot,
+                events=events,
+                fps=30,
+                teleop_action_processor=lambda x: x[0],
+                robot_action_processor=lambda x: x[0],
+                robot_observation_processor=lambda x: x,
+                dataset=dataset,
+                policy=_Policy(),
+                preprocessor=_Runtime(),
+                postprocessor=_Runtime(),
+                policy_action_processor=policy_action_processor,
+                policy_features={
+                    "action": {"dtype": "float32", "shape": (16,), "names": action_names},
+                    "observation.state": {"dtype": "float32", "shape": (1,), "names": ["motor_1.pos"]},
+                },
+                control_time_s=10.0,
+            )
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+    first_action, _ = policy_action_processor.calls[0]
+    right_only_action, _ = policy_action_processor.calls[1]
+    left_only_action, _ = policy_action_processor.calls[2]
+    assert first_action["left_enabled"] is True
+    assert first_action["right_enabled"] is True
+    assert right_only_action["left_enabled"] is False
+    assert right_only_action["right_enabled"] is True
+    assert left_only_action["left_enabled"] is True
+    assert left_only_action["right_enabled"] is False
+    assert "left_enabled" not in dataset.frames[0]
+
+
+def test_policy_ee_adapter_uses_sdk_zero_offset_without_mutating_teleop_config():
+    teleop_cfg = BiQuest3VRTeleopConfig()
+    original_offset = teleop_cfg.piper_ee_offset_xyzrpy
+
+    with patch(
+        "lerobot.scripts.lerobot_record.make_bi_quest3_vr_robot_action_processor_from_config",
+        return_value=object(),
+    ) as make_processor:
+        _make_policy_action_processor_for_ee_pose(SimpleNamespace(teleop=teleop_cfg))
+
+    cfg = make_processor.call_args.args[0]
+    assert cfg is not teleop_cfg
+    assert cfg.piper_ee_offset_xyzrpy == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert teleop_cfg.piper_ee_offset_xyzrpy == original_offset
+    assert original_offset == (0.0, 0.0, 0.13, 0.0, -1.57, 0.0)
+
+
+def test_single_arm_policy_ee_adapter_uses_sdk_zero_offset_without_mutating_teleop_config():
+    teleop_cfg = Quest3VRTeleopConfig()
+    original_offset = teleop_cfg.piper_ee_offset_xyzrpy
+
+    with patch(
+        "lerobot.scripts.lerobot_record.make_quest3_vr_robot_action_processor_from_config",
+        return_value=object(),
+    ) as make_processor:
+        _make_policy_action_processor_for_ee_pose(SimpleNamespace(teleop=teleop_cfg))
+
+    cfg = make_processor.call_args.args[0]
+    assert cfg is not teleop_cfg
+    assert cfg.piper_ee_offset_xyzrpy == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert teleop_cfg.piper_ee_offset_xyzrpy == original_offset
+    assert original_offset == (0.0, 0.0, 0.13, 0.0, -1.57, 0.0)
 
 
 def test_record_calls_episode_reset_hooks_after_last_episode(tmp_path):

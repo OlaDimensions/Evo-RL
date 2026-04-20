@@ -559,7 +559,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         return np.array([dx, dy, dz], dtype=np.float64), np.array([drx, dry, drz], dtype=np.float64)
 
     def _action_to_absolute_target(self, action: RobotAction) -> np.ndarray | None:
-        keys = [
+        target_rpy_keys = [
             "ee.target_x",
             "ee.target_y",
             "ee.target_z",
@@ -568,12 +568,30 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             "ee.target_rz",
         ]
         values: list[float] = []
-        for key in keys:
+        for key in target_rpy_keys:
+            value = action.get(self._in(key))
+            if value is None:
+                break
+            values.append(float(value))
+        else:
+            return self._xyzrpy_to_matrix(*values)
+
+        target_quat_keys = [
+            "ee.x",
+            "ee.y",
+            "ee.z",
+            "ee.qx",
+            "ee.qy",
+            "ee.qz",
+            "ee.qw",
+        ]
+        values = []
+        for key in target_quat_keys:
             value = action.get(self._in(key))
             if value is None:
                 return None
             values.append(float(value))
-        return self._xyzrpy_to_matrix(*values)
+        return self._xyzquat_to_matrix(*values)
 
     def _map_absolute_target(self, abs_target_T: np.ndarray) -> np.ndarray:
         input_anchor_T = self._state.absolute_input_anchor_T
@@ -802,6 +820,46 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         T[0] = [ca * cb, ca * sb * sc - sa * cc, sa * sc + ca * sb * cc, x]
         T[1] = [sa * cb, ca * cc + sa * sb * sc, sa * sb * cc - ca * sc, y]
         T[2] = [-sb, cb * sc, cb * cc, z]
+        return T
+
+    @staticmethod
+    def _xyzquat_to_matrix(
+        x: float,
+        y: float,
+        z: float,
+        qx: float,
+        qy: float,
+        qz: float,
+        qw: float,
+    ) -> np.ndarray:
+        quat = np.asarray([qx, qy, qz, qw], dtype=np.float64)
+        norm = float(np.linalg.norm(quat))
+        if not np.isfinite(norm) or norm <= 1e-12:
+            raise ValueError("Invalid EE quaternion target: expected finite non-zero [qx, qy, qz, qw].")
+        qx, qy, qz, qw = (quat / norm).tolist()
+
+        T = np.eye(4, dtype=np.float64)
+        T[:3, 3] = [x, y, z]
+        T[:3, :3] = np.array(
+            [
+                [
+                    1.0 - 2.0 * (qy * qy + qz * qz),
+                    2.0 * (qx * qy - qz * qw),
+                    2.0 * (qx * qz + qy * qw),
+                ],
+                [
+                    2.0 * (qx * qy + qz * qw),
+                    1.0 - 2.0 * (qx * qx + qz * qz),
+                    2.0 * (qy * qz - qx * qw),
+                ],
+                [
+                    2.0 * (qx * qz - qy * qw),
+                    2.0 * (qy * qz + qx * qw),
+                    1.0 - 2.0 * (qx * qx + qy * qy),
+                ],
+            ],
+            dtype=np.float64,
+        )
         return T
 
 

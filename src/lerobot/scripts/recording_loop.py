@@ -43,6 +43,7 @@ from lerobot.scripts.recording_hil import (
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
+from lerobot.scripts.ee_pose_action_utils import with_bimanual_ee_enabled_flags
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -130,6 +131,9 @@ def record_loop(
     policy: PreTrainedPolicy | None = None,
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
+    policy_action_processor: (
+        RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction] | None
+    ) = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
@@ -142,7 +146,9 @@ def record_loop(
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
     control_features: dict[str, Any] | None = None,
+    policy_features: dict[str, Any] | None = None,
     ee_pose_storage: Any | None = None,
+    policy_stationary_arm_delta_threshold: float = 1e-5,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -178,13 +184,15 @@ def record_loop(
     if dataset is None and policy is not None:
         raise ValueError("Policy-driven recording requires a dataset for feature mapping.")
 
-    if control_features is not None:
-        features_for_control = control_features
-    elif dataset is not None:
-        features_for_control = dataset.features
+    if dataset is not None:
+        features_for_policy = policy_features
+        if features_for_policy is None:
+            features_for_policy = control_features if control_features is not None else dataset.features
+        features_for_storage_completion = control_features if control_features is not None else dataset.features
     else:
-        features_for_control = None
-    action_feature_names = features_for_control[ACTION]["names"] if features_for_control is not None else None
+        features_for_policy = None
+        features_for_storage_completion = None
+    action_feature_names = features_for_policy[ACTION]["names"] if features_for_policy is not None else None
     if action_feature_names is None:
         if hasattr(robot.action_features, "keys"):
             action_feature_names = list(robot.action_features.keys())
@@ -196,6 +204,7 @@ def record_loop(
     intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
     last_action_values_for_storage: RobotAction | None = None
+    last_policy_action_for_enabled: RobotAction | None = None
     teleop_fallback_warned = False
 
     teleop_arm_for_mode_switch: Any | None = None
@@ -223,6 +232,9 @@ def record_loop(
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
+        if policy_action_processor is not None:
+            policy_action_processor.reset()
+            last_policy_action_for_enabled = None
 
     cond_policy_runtime_state: dict[str, Any] | None = None
     uncond_policy_runtime_state: dict[str, Any] | None = None
@@ -300,6 +312,9 @@ def record_loop(
                         policy.reset()
                         preprocessor.reset()
                         postprocessor.reset()
+                        if policy_action_processor is not None:
+                            policy_action_processor.reset()
+                            last_policy_action_for_enabled = None
                         if acp_inference.enable and acp_inference.use_cfg:
                             cond_policy_runtime_state = _capture_policy_runtime_state(policy)
                             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
@@ -316,18 +331,24 @@ def record_loop(
         obs_processed = robot_observation_processor(obs)
 
         if dataset is not None:
-            policy_observation_frame = build_dataset_frame(
-                features_for_control, obs_processed, prefix=OBS_STR
-            )
             ee_state_before_action = (
                 run_with_connection_retry("ee_pose_storage.read_state", ee_pose_storage.read)
                 if ee_pose_storage is not None
                 else None
             )
+            observation_values_for_policy = (
+                {**obs_processed, **ee_state_before_action}
+                if ee_state_before_action is not None
+                else obs_processed
+            )
+            policy_observation_frame = build_dataset_frame(
+                features_for_policy, observation_values_for_policy, prefix=OBS_STR
+            )
 
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
+        raw_policy_action_for_storage: RobotAction | None = None
         if (
             policy is not None
             and preprocessor is not None
@@ -347,7 +368,18 @@ def record_loop(
                 cond_runtime_state=cond_policy_runtime_state,
                 uncond_runtime_state=uncond_policy_runtime_state,
             )
-            act_processed_policy = make_robot_action(policy_action, features_for_control)
+            raw_policy_action_for_storage = make_robot_action(policy_action, features_for_policy)
+            policy_action_for_execution = with_bimanual_ee_enabled_flags(
+                raw_policy_action_for_storage,
+                last_policy_action_for_enabled,
+                policy_stationary_arm_delta_threshold,
+            )
+            last_policy_action_for_enabled = raw_policy_action_for_storage
+            act_processed_policy = (
+                policy_action_processor((policy_action_for_execution, obs))
+                if policy_action_processor is not None
+                else raw_policy_action_for_storage
+            )
 
         if isinstance(teleop, Teleoperator):
             act = run_with_connection_retry("teleop.get_action", teleop.get_action)
@@ -375,9 +407,7 @@ def record_loop(
             last_teleop_action = act_processed_teleop
             teleop_fallback_warned = False
 
-        policy_action_for_storage = (
-            act_processed_policy if act_processed_policy is not None else zero_policy_action
-        )
+        policy_action_for_storage = raw_policy_action_for_storage or zero_policy_action
 
         is_intervention = 0.0
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
@@ -438,7 +468,7 @@ def record_loop(
         # Write to dataset
         if dataset is not None:
             action_values_for_storage = _complete_action_values_for_dataset(
-                features_for_control,
+                features_for_storage_completion,
                 action_values,
                 obs_processed,
                 last_action_values_for_storage,
@@ -450,9 +480,12 @@ def record_loop(
                     raise RuntimeError("EE pose storage is enabled but SDK pose feedback was not captured.")
                 observation_values_for_storage = {**obs_processed, **ee_state_before_action}
                 action_values_for_frame = ee_action_after_action
-                policy_action_values_for_frame = (
-                    ee_action_after_action if selected_from_policy else ee_pose_storage.zero()
-                )
+                if selected_from_policy and policy_action_processor is not None:
+                    policy_action_values_for_frame = policy_action_for_storage
+                elif selected_from_policy:
+                    policy_action_values_for_frame = ee_action_after_action
+                else:
+                    policy_action_values_for_frame = ee_pose_storage.zero()
             else:
                 observation_values_for_storage = obs_processed
                 action_values_for_frame = action_values_for_storage

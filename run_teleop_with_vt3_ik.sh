@@ -83,17 +83,20 @@ exec env \
   --robot.right_arm_config.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}' \
   --teleop.type=bi_quest3_vr \
   --teleop.id=my_bi_vr_leader \
-  --dataset.repo_id=ruanafan/evo-rl-data-pnp-vr-ee-pose-round0-0418-1 \
-  --dataset.single_task="Pick up the white bottle and insert it into the middle of the tape roll" \
+  --dataset.repo_id=ruanafan/eval_evo-rl-data-pnp-vr-ee-pose-round0-0418-pi05-12w-infer-1 \
+  --dataset.single_task="Locate and pull open the air fryer drawer, pick up the sweet potato and place it steadily into the basket, then push the drawer back." \
   --dataset.num_episodes=20 \
-  --dataset.episode_time_s=80 \
-  --dataset.reset_time_s=20 \
+  --dataset.episode_time_s=100 \
+  --dataset.reset_time_s=30 \
   --dataset.push_to_hub=false \
   --display_data=true \
   --teleop.ik_pose_error_mode=reject \
   --teleop.ik_max_position_error_m=0.08 \
   --teleop.ik_max_orientation_error_deg=60 \
-  --record_ee_pose=true
+  --record_ee_pose=true \
+  --policy.path=outputs/train/pi05_0418/12w/pretrained_model/ \
+  --policy_sync_to_teleop=true \
+  --policy_sync_parallel=true
   # > teleop_with_vt3_ik_ee_pose.log 2>&1
   
   # lerobot-human-inloop-record  \  #single

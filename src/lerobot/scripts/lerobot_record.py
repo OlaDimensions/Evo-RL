@@ -67,6 +67,7 @@ import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
+from typing import Any
 
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
@@ -108,8 +109,10 @@ from lerobot.scripts.recording_hil import (
 )
 from lerobot.scripts.recording_ee_pose import (
     PiperEEPoseStorage,
+    get_piper_ee_pose_names,
     replace_low_dim_features_with_piper_ee_pose,
 )
+from lerobot.scripts.ee_pose_action_utils import SDK_EE_OFFSET_XYZRPY
 from lerobot.scripts.recording_loop import record_loop
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
@@ -252,6 +255,8 @@ class RecordConfig:
     communication_retry_interval_s: float = 0.1
     # Store low-dimensional Piper state/action as SDK end-effector pose feedback instead of joint positions.
     record_ee_pose: bool = False
+    # Treat a bimanual EE-pose policy arm as stationary when its per-frame action delta is at or below this.
+    policy_stationary_arm_delta_threshold: float = 1e-5
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -301,6 +306,8 @@ class RecordConfig:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
+        if self.policy_stationary_arm_delta_threshold < 0:
+            raise ValueError("`policy_stationary_arm_delta_threshold` must be >= 0.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -329,6 +336,36 @@ def _ensure_human_inloop_compatible_features(
         "shape": (1,),
         "names": ["state"],
     }
+
+
+def _policy_action_dim(cfg: PreTrainedConfig | None) -> int | None:
+    if cfg is None or cfg.action_feature is None:
+        return None
+    shape = cfg.action_feature.shape
+    if not shape:
+        return None
+    return int(shape[0])
+
+
+def _metadata_with_features(meta: Any, features: dict[str, dict]) -> Any:
+    meta_copy = copy(meta)
+    meta_copy.info = deepcopy(meta.info)
+    meta_copy.info["features"] = features
+    return meta_copy
+
+
+def _make_policy_action_processor_for_ee_pose(cfg: RecordConfig) -> Any | None:
+    if cfg.teleop is None:
+        return None
+    if cfg.teleop.type == "quest3_vr":
+        teleop_cfg = copy(cfg.teleop)
+        teleop_cfg.piper_ee_offset_xyzrpy = SDK_EE_OFFSET_XYZRPY
+        return make_quest3_vr_robot_action_processor_from_config(teleop_cfg)
+    if cfg.teleop.type == "bi_quest3_vr":
+        teleop_cfg = copy(cfg.teleop)
+        teleop_cfg.piper_ee_offset_xyzrpy = SDK_EE_OFFSET_XYZRPY
+        return make_bi_quest3_vr_robot_action_processor_from_config(teleop_cfg)
+    return None
 
 
 @parser.wrap()
@@ -398,6 +435,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     dataset = None
     listener = None
     policy_sync_executor = None
+    policy_action_processor = None
     ee_pose_storage = PiperEEPoseStorage(robot) if cfg.record_ee_pose else None
 
     try:
@@ -431,13 +469,47 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 vcodec=cfg.dataset.vcodec,
             )
 
-        # Load pretrained policy. When EE-pose storage is enabled, keep policy inference on the original
-        # joint-space features so the storage schema does not change robot control semantics.
+        # Load pretrained policy. When EE-pose storage is enabled, support both legacy joint-space
+        # policies and newer EE-pose policies. EE-pose policy outputs are adapted to Piper joint
+        # commands by an independent policy action processor before they reach robot.send_action().
         policy_ds_meta = dataset.meta
+        policy_features = dataset.meta.features
         if cfg.record_ee_pose:
-            policy_ds_meta = copy(dataset.meta)
-            policy_ds_meta.info = deepcopy(dataset.meta.info)
-            policy_ds_meta.info["features"] = control_features
+            ee_action_dim = len(get_piper_ee_pose_names(robot))
+            joint_action_dim = len(control_features[ACTION]["names"])
+            action_dim = _policy_action_dim(cfg.policy)
+
+            if cfg.policy is None or action_dim is None:
+                policy_ds_meta = _metadata_with_features(dataset.meta, control_features)
+                policy_features = control_features
+            elif action_dim == ee_action_dim:
+                policy_action_processor = _make_policy_action_processor_for_ee_pose(cfg)
+                if policy_action_processor is None:
+                    raise ValueError(
+                        "`record_ee_pose=true` detected an EE-pose policy action shape, but no Piper "
+                        f"EE action adapter is available for teleop type '{getattr(cfg.teleop, 'type', None)}'."
+                    )
+                policy_ds_meta = dataset.meta
+                policy_features = dataset.meta.features
+                logging.info(
+                    "`record_ee_pose=true`: policy action dim=%d matches Piper EE-pose schema; "
+                    "policy outputs will be adapted through EE->joint IK before robot execution.",
+                    action_dim,
+                )
+            elif action_dim == joint_action_dim:
+                policy_ds_meta = _metadata_with_features(dataset.meta, control_features)
+                policy_features = control_features
+                logging.info(
+                    "`record_ee_pose=true`: policy action dim=%d matches legacy joint-space schema; "
+                    "policy execution will keep the existing joint-space control path.",
+                    action_dim,
+                )
+            else:
+                raise ValueError(
+                    "`record_ee_pose=true` policy action shape is incompatible with this robot. "
+                    f"Got action_dim={action_dim}, expected EE-pose dim={ee_action_dim} or "
+                    f"joint-space dim={joint_action_dim}."
+                )
 
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=policy_ds_meta)
         preprocessor = None
@@ -504,6 +576,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     policy=policy,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
+                    policy_action_processor=policy_action_processor,
                     dataset=dataset,
                     control_time_s=cfg.dataset.episode_time_s,
                     single_task=cfg.dataset.single_task,
@@ -517,7 +590,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                     control_features=control_features if cfg.record_ee_pose else None,
+                    policy_features=policy_features,
                     ee_pose_storage=ee_pose_storage,
+                    policy_stationary_arm_delta_threshold=cfg.policy_stationary_arm_delta_threshold,
                 )
 
                 episode_success = None
@@ -581,7 +656,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                         communication_retry_interval_s=cfg.communication_retry_interval_s,
                         control_features=control_features if cfg.record_ee_pose else None,
+                        policy_features=policy_features,
                         ee_pose_storage=ee_pose_storage,
+                        policy_stationary_arm_delta_threshold=cfg.policy_stationary_arm_delta_threshold,
                     )
 
                     if callable(prepare_episode_start):
