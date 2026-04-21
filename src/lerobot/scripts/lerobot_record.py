@@ -109,10 +109,18 @@ from lerobot.scripts.recording_hil import (
 )
 from lerobot.scripts.recording_ee_pose import (
     PiperEEPoseStorage,
-    get_piper_ee_pose_names,
     replace_low_dim_features_with_piper_ee_pose,
 )
-from lerobot.scripts.ee_pose_action_utils import SDK_EE_OFFSET_XYZRPY
+from lerobot.scripts.ee_pose_action_utils import (
+    ACTION_SCHEMA_NAMES,
+    BIMANUAL_EE_RPY_NAMES,
+    MapPolicyQuatActionToRPYStep,
+    MapPolicyRPYActionToIKTargetsStep,
+    MapPolicyRXRYRZActionToRPYStep,
+    SDK_EE_OFFSET_XYZRPY,
+    bimanual_ee_quat_to_rpy_values,
+    detect_action_schema_from_names,
+)
 from lerobot.scripts.recording_loop import record_loop
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
@@ -135,7 +143,7 @@ from lerobot.teleoperators.quest3_vr.processors import (
     make_bi_quest3_vr_robot_action_processor_from_config,
     make_quest3_vr_robot_action_processor_from_config,
 )
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -255,6 +263,8 @@ class RecordConfig:
     communication_retry_interval_s: float = 0.1
     # Store low-dimensional Piper state/action as SDK end-effector pose feedback instead of joint positions.
     record_ee_pose: bool = False
+    # Policy action schema used when `record_ee_pose=true`.
+    policy_action_schema: str = "bimanual_ee_quat"
     # Treat a bimanual EE-pose policy arm as stationary when its per-frame action delta is at or below this.
     policy_stationary_arm_delta_threshold: float = 1e-5
 
@@ -308,6 +318,11 @@ class RecordConfig:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
         if self.policy_stationary_arm_delta_threshold < 0:
             raise ValueError("`policy_stationary_arm_delta_threshold` must be >= 0.")
+        if self.record_ee_pose and self.policy_action_schema not in {"bimanual_ee_quat", "bimanual_ee_rpy"}:
+            raise ValueError(
+                "`record_ee_pose=true` requires `policy_action_schema` to be one of "
+                "['bimanual_ee_quat', 'bimanual_ee_rpy']."
+            )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -354,6 +369,98 @@ def _metadata_with_features(meta: Any, features: dict[str, dict]) -> Any:
     return meta_copy
 
 
+def _policy_features_with_action_names(
+    features: dict[str, dict],
+    action_names: tuple[str, ...],
+    observation_state_names: tuple[str, ...] | None = None,
+) -> dict[str, dict]:
+    policy_features = deepcopy(features)
+    if ACTION in policy_features:
+        policy_features[ACTION] = {
+            **policy_features[ACTION],
+            "shape": (len(action_names),),
+            "names": list(action_names),
+        }
+    if observation_state_names is not None and OBS_STATE in policy_features:
+        policy_features[OBS_STATE] = {
+            **policy_features[OBS_STATE],
+            "shape": (len(observation_state_names),),
+            "names": list(observation_state_names),
+        }
+    return policy_features
+
+
+def _bimanual_ee_rpy_policy_observation(values: dict[str, Any]) -> dict[str, Any]:
+    return {**values, **bimanual_ee_quat_to_rpy_values(values)}
+
+
+def _set_policy_action_schema(features: dict[str, dict], action_names: tuple[str, ...]) -> None:
+    if "complementary_info.policy_action" in features:
+        features["complementary_info.policy_action"] = {
+            **features["complementary_info.policy_action"],
+            "shape": (len(action_names),),
+            "names": list(action_names),
+        }
+
+
+def _auto_policy_action_names_for_ee_pose(robot: Any, ee_pose_format: str) -> tuple[str, ...]:
+    if ee_pose_format == "rpy":
+        if hasattr(robot, "left_arm") and hasattr(robot, "right_arm"):
+            return ACTION_SCHEMA_NAMES["bimanual_ee_rpy"]
+        return ACTION_SCHEMA_NAMES["single_ee_rpy"]
+    if ee_pose_format == "quat":
+        if hasattr(robot, "left_arm") and hasattr(robot, "right_arm"):
+            return ACTION_SCHEMA_NAMES["bimanual_ee_quat"]
+        return ACTION_SCHEMA_NAMES["single_ee_quat"]
+    raise ValueError(f"Unsupported EE pose format: {ee_pose_format!r}.")
+
+
+def _ensure_ee_policy_schema_matches_storage(
+    *,
+    policy_action_schema: str,
+    policy_action_names: tuple[str, ...],
+    robot: Any,
+    ee_pose_format: str,
+) -> None:
+    expected_names = _auto_policy_action_names_for_ee_pose(robot, ee_pose_format)
+    if policy_action_names != expected_names:
+        raise ValueError(
+            f"`record_ee_pose=true` with `{ee_pose_format}` storage requires the EE policy action schema "
+            f"to match {list(expected_names)}, got schema={policy_action_schema!r} "
+            f"names={list(policy_action_names)}."
+        )
+
+
+@dataclass(frozen=True)
+class _PolicyActionDescriptor:
+    source: str
+    schema: str
+    action_names: tuple[str, ...]
+
+
+def _resolve_policy_action_descriptor(cfg: Any, control_features: dict[str, dict]) -> _PolicyActionDescriptor:
+    if getattr(cfg, "policy", None) is None:
+        return _PolicyActionDescriptor(source="unknown", schema="unknown", action_names=())
+
+    action_names = getattr(cfg, "policy_action_names", None)
+    if action_names is None:
+        schema = getattr(cfg, "policy_action_schema", None)
+        if schema in ACTION_SCHEMA_NAMES:
+            action_names = ACTION_SCHEMA_NAMES[schema]
+        else:
+            return _PolicyActionDescriptor(source="policy", schema="unknown", action_names=())
+
+    joint_names = tuple(control_features[ACTION]["names"])
+    resolved_schema = detect_action_schema_from_names(tuple(action_names), joint_names)
+    if resolved_schema == "unknown":
+        raise ValueError(f"Unable to resolve `policy_action_names`: {list(action_names)}.")
+    return _PolicyActionDescriptor(
+        source="policy",
+        schema=resolved_schema,
+        action_names=tuple(action_names),
+    )
+
+
 def _make_policy_action_processor_for_ee_pose(cfg: RecordConfig) -> Any | None:
     if cfg.teleop is None:
         return None
@@ -366,6 +473,69 @@ def _make_policy_action_processor_for_ee_pose(cfg: RecordConfig) -> Any | None:
         teleop_cfg.piper_ee_offset_xyzrpy = SDK_EE_OFFSET_XYZRPY
         return make_bi_quest3_vr_robot_action_processor_from_config(teleop_cfg)
     return None
+
+
+def _compose_policy_action_processor(steps: list[Any], ik_processor: Any) -> Any:
+    return type(ik_processor)(
+        steps=[*steps, *ik_processor.steps],
+        to_transition=ik_processor.to_transition,
+        to_output=ik_processor.to_output,
+    )
+
+
+def _make_policy_action_processor_for_rpy_schema(action_names: tuple[str, ...], robot: Any) -> Any:
+    if tuple(action_names) == BIMANUAL_EE_RPY_NAMES:
+        if not (
+            hasattr(robot, "left_arm")
+            and hasattr(robot, "right_arm")
+            or getattr(robot, "name", None) in {"bi_piper_follower", "bi_piper_x_follower"}
+        ):
+            raise ValueError("bimanual_ee_rpy policy actions require a bimanual Piper/PiperX follower robot.")
+        ik_processor = make_bi_quest3_vr_robot_action_processor_from_config(
+            BiQuest3VRTeleopConfig(piper_ee_offset_xyzrpy=SDK_EE_OFFSET_XYZRPY)
+        )
+        return _compose_policy_action_processor(
+            [MapPolicyRPYActionToIKTargetsStep(bimanual=True)], ik_processor
+        )
+
+    if tuple(action_names) == ACTION_SCHEMA_NAMES["single_ee_rpy"]:
+        if getattr(robot, "name", None) not in {"piper_follower", "piper_x_follower"}:
+            raise ValueError("single_ee_rpy policy actions require a single-arm Piper/PiperX follower robot.")
+        ik_processor = make_quest3_vr_robot_action_processor_from_config(
+            Quest3VRTeleopConfig(piper_ee_offset_xyzrpy=SDK_EE_OFFSET_XYZRPY)
+        )
+        return _compose_policy_action_processor([MapPolicyRPYActionToIKTargetsStep()], ik_processor)
+
+    raise ValueError(f"Unsupported RPY policy action names: {list(action_names)}.")
+
+
+def _make_policy_action_processor_for_ee_schema(
+    policy_action_schema: str,
+    policy_action_names: tuple[str, ...],
+    robot: Any,
+    cfg: RecordConfig,
+) -> Any | None:
+    if policy_action_schema == "joint":
+        return None
+    if policy_action_schema == "bimanual_ee_quat":
+        return _make_policy_action_processor_for_ee_pose(cfg)
+    if policy_action_schema == "bimanual_ee_rpy":
+        return _make_policy_action_processor_for_rpy_schema(policy_action_names, robot)
+    if policy_action_schema == "single_ee_rxryrz":
+        ik_processor = make_quest3_vr_robot_action_processor_from_config(
+            Quest3VRTeleopConfig(piper_ee_offset_xyzrpy=SDK_EE_OFFSET_XYZRPY)
+        )
+        return _compose_policy_action_processor(
+            [MapPolicyRXRYRZActionToRPYStep(), MapPolicyRPYActionToIKTargetsStep()], ik_processor
+        )
+    if policy_action_schema == "single_ee_quat":
+        ik_processor = make_quest3_vr_robot_action_processor_from_config(
+            Quest3VRTeleopConfig(piper_ee_offset_xyzrpy=SDK_EE_OFFSET_XYZRPY)
+        )
+        return _compose_policy_action_processor(
+            [MapPolicyQuatActionToRPYStep(), MapPolicyRPYActionToIKTargetsStep()], ik_processor
+        )
+    raise ValueError(f"Unsupported policy action schema: {policy_action_schema!r}.")
 
 
 @parser.wrap()
@@ -427,6 +597,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     if cfg.record_ee_pose:
         replace_low_dim_features_with_piper_ee_pose(dataset_features, robot)
+        if cfg.policy_action_schema == "bimanual_ee_rpy":
+            _set_policy_action_schema(dataset_features, BIMANUAL_EE_RPY_NAMES)
         logging.info(
             "`record_ee_pose=true`: dataset low-dimensional state/action will be stored as Piper SDK "
             "end-effector feedback pose. Robot control still uses joint actions."
@@ -436,6 +608,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     listener = None
     policy_sync_executor = None
     policy_action_processor = None
+    policy_observation_transform = None
     ee_pose_storage = PiperEEPoseStorage(robot) if cfg.record_ee_pose else None
 
     try:
@@ -475,40 +648,49 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         policy_ds_meta = dataset.meta
         policy_features = dataset.meta.features
         if cfg.record_ee_pose:
-            ee_action_dim = len(get_piper_ee_pose_names(robot))
-            joint_action_dim = len(control_features[ACTION]["names"])
             action_dim = _policy_action_dim(cfg.policy)
 
             if cfg.policy is None or action_dim is None:
                 policy_ds_meta = _metadata_with_features(dataset.meta, control_features)
                 policy_features = control_features
-            elif action_dim == ee_action_dim:
-                policy_action_processor = _make_policy_action_processor_for_ee_pose(cfg)
+            else:
+                if cfg.policy_action_schema not in {"bimanual_ee_quat", "bimanual_ee_rpy"}:
+                    raise ValueError(
+                        "`record_ee_pose=true` policy execution only supports "
+                        "`policy_action_schema=bimanual_ee_quat` or `bimanual_ee_rpy`."
+                    )
+                policy_action_names = ACTION_SCHEMA_NAMES[cfg.policy_action_schema]
+                if action_dim != len(policy_action_names):
+                    raise ValueError(
+                        "`record_ee_pose=true` policy action shape is incompatible with "
+                        f"`policy_action_schema={cfg.policy_action_schema}`. Got action_dim={action_dim}, "
+                        f"expected {len(policy_action_names)}."
+                    )
+                policy_observation_names = (
+                    BIMANUAL_EE_RPY_NAMES if cfg.policy_action_schema == "bimanual_ee_rpy" else None
+                )
+                policy_features = _policy_features_with_action_names(
+                    dataset.meta.features,
+                    policy_action_names,
+                    observation_state_names=policy_observation_names,
+                )
+                _set_policy_action_schema(policy_features, policy_action_names)
+                if cfg.policy_action_schema == "bimanual_ee_rpy":
+                    policy_observation_transform = _bimanual_ee_rpy_policy_observation
+                policy_ds_meta = _metadata_with_features(dataset.meta, policy_features)
+                policy_action_processor = _make_policy_action_processor_for_ee_schema(
+                    cfg.policy_action_schema, policy_action_names, robot, cfg
+                )
                 if policy_action_processor is None:
                     raise ValueError(
-                        "`record_ee_pose=true` detected an EE-pose policy action shape, but no Piper "
-                        f"EE action adapter is available for teleop type '{getattr(cfg.teleop, 'type', None)}'."
+                        "`record_ee_pose=true` detected an EE-pose policy action schema, but no Piper "
+                        f"EE action adapter is available for schema '{cfg.policy_action_schema}'."
                     )
-                policy_ds_meta = dataset.meta
-                policy_features = dataset.meta.features
                 logging.info(
-                    "`record_ee_pose=true`: policy action dim=%d matches Piper EE-pose schema; "
+                    "`record_ee_pose=true`: policy_action_schema=%s action_dim=%d; "
                     "policy outputs will be adapted through EE->joint IK before robot execution.",
+                    cfg.policy_action_schema,
                     action_dim,
-                )
-            elif action_dim == joint_action_dim:
-                policy_ds_meta = _metadata_with_features(dataset.meta, control_features)
-                policy_features = control_features
-                logging.info(
-                    "`record_ee_pose=true`: policy action dim=%d matches legacy joint-space schema; "
-                    "policy execution will keep the existing joint-space control path.",
-                    action_dim,
-                )
-            else:
-                raise ValueError(
-                    "`record_ee_pose=true` policy action shape is incompatible with this robot. "
-                    f"Got action_dim={action_dim}, expected EE-pose dim={ee_action_dim} or "
-                    f"joint-space dim={joint_action_dim}."
                 )
 
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=policy_ds_meta)
@@ -591,6 +773,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                     control_features=control_features if cfg.record_ee_pose else None,
                     policy_features=policy_features,
+                    policy_observation_transform=policy_observation_transform,
                     ee_pose_storage=ee_pose_storage,
                     policy_stationary_arm_delta_threshold=cfg.policy_stationary_arm_delta_threshold,
                 )
@@ -657,6 +840,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         communication_retry_interval_s=cfg.communication_retry_interval_s,
                         control_features=control_features if cfg.record_ee_pose else None,
                         policy_features=policy_features,
+                        policy_observation_transform=policy_observation_transform,
                         ee_pose_storage=ee_pose_storage,
                         policy_stationary_arm_delta_threshold=cfg.policy_stationary_arm_delta_threshold,
                     )

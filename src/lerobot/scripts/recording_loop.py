@@ -147,6 +147,7 @@ def record_loop(
     communication_retry_interval_s: float = 0.1,
     control_features: dict[str, Any] | None = None,
     policy_features: dict[str, Any] | None = None,
+    policy_observation_transform: Callable[[RobotObservation], RobotObservation] | None = None,
     ee_pose_storage: Any | None = None,
     policy_stationary_arm_delta_threshold: float = 1e-5,
 ):
@@ -341,6 +342,8 @@ def record_loop(
                 if ee_state_before_action is not None
                 else obs_processed
             )
+            if policy_observation_transform is not None:
+                observation_values_for_policy = policy_observation_transform(observation_values_for_policy)
             policy_observation_frame = build_dataset_frame(
                 features_for_policy, observation_values_for_policy, prefix=OBS_STR
             )
