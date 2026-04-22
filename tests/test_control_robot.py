@@ -45,6 +45,7 @@ from lerobot.scripts.lerobot_record import (
     record,
     record_loop,
 )
+from lerobot.scripts.ee_pose_action_utils import BIMANUAL_EE_RPY_NAMES, bimanual_ee_quat_to_rpy_values
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
 from lerobot.teleoperators.bi_quest3_vr.config_bi_quest3_vr import BiQuest3VRTeleopConfig
@@ -399,6 +400,169 @@ def test_record_loop_adapts_policy_ee_action_before_robot_send(tmp_path):
     assert robot.send_action.call_args.args[0] == {"motor_1.pos": 7.0}
     assert dataset.frames
     assert policy_action_processor.reset_calls == 1
+
+
+def test_record_loop_converts_sdk_quat_feedback_to_rpy_policy_observation(tmp_path):
+    class _Dataset:
+        fps = 30
+        features = {
+            "action": {
+                "dtype": "float32",
+                "shape": (16,),
+                "names": [
+                    "left_ee.x",
+                    "left_ee.y",
+                    "left_ee.z",
+                    "left_ee.qx",
+                    "left_ee.qy",
+                    "left_ee.qz",
+                    "left_ee.qw",
+                    "left_gripper.pos",
+                    "right_ee.x",
+                    "right_ee.y",
+                    "right_ee.z",
+                    "right_ee.qx",
+                    "right_ee.qy",
+                    "right_ee.qz",
+                    "right_ee.qw",
+                    "right_gripper.pos",
+                ],
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (16,),
+                "names": [
+                    "left_ee.x",
+                    "left_ee.y",
+                    "left_ee.z",
+                    "left_ee.qx",
+                    "left_ee.qy",
+                    "left_ee.qz",
+                    "left_ee.qw",
+                    "left_gripper.pos",
+                    "right_ee.x",
+                    "right_ee.y",
+                    "right_ee.z",
+                    "right_ee.qx",
+                    "right_ee.qy",
+                    "right_ee.qz",
+                    "right_ee.qw",
+                    "right_gripper.pos",
+                ],
+            },
+        }
+
+        def __init__(self):
+            self.frames = []
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+    class _Runtime:
+        def reset(self):
+            pass
+
+    class _Policy(_Runtime):
+        config = type("Config", (), {"device": "cpu", "use_amp": False})()
+
+    class _PolicyActionAdapter:
+        def reset(self):
+            pass
+
+        def __call__(self, payload):
+            return {"motor_1.pos": 7.0}
+
+    class _EEPoseStorage:
+        def reset(self):
+            pass
+
+        def read(self):
+            return {
+                "left_ee.x": 0.1,
+                "left_ee.y": 0.2,
+                "left_ee.z": 0.3,
+                "left_ee.qx": 0.0,
+                "left_ee.qy": 0.0,
+                "left_ee.qz": 0.0,
+                "left_ee.qw": 1.0,
+                "left_gripper.pos": 0.7,
+                "right_ee.x": 1.1,
+                "right_ee.y": 1.2,
+                "right_ee.z": 1.3,
+                "right_ee.qx": 0.0,
+                "right_ee.qy": 0.0,
+                "right_ee.qz": 0.0,
+                "right_ee.qw": 1.0,
+                "right_gripper.pos": 1.7,
+            }
+
+    robot = MockRobot(
+        MockRobotConfig(
+            n_motors=1,
+            random_values=False,
+            static_values=[1.0],
+            calibration_dir=tmp_path / "calibration",
+        )
+    )
+    robot.connect()
+    captured_observation_frames = []
+
+    def _predict_policy_action(**kwargs):
+        captured_observation_frames.append(kwargs["observation_frame"])
+        return torch.zeros((1, len(BIMANUAL_EE_RPY_NAMES)), dtype=torch.float32)
+
+    try:
+        with patch(
+            "lerobot.scripts.recording_loop._predict_policy_action_with_acp_inference",
+            side_effect=_predict_policy_action,
+        ):
+            record_loop(
+                robot=robot,
+                events={
+                    "exit_early": False,
+                    "rerecord_episode": False,
+                    "stop_recording": False,
+                    "toggle_intervention": False,
+                    "episode_outcome": None,
+                },
+                fps=30,
+                teleop_action_processor=lambda x: x[0],
+                robot_action_processor=lambda x: x[0],
+                robot_observation_processor=lambda x: x,
+                dataset=_Dataset(),
+                policy=_Policy(),
+                preprocessor=_Runtime(),
+                postprocessor=_Runtime(),
+                policy_action_processor=_PolicyActionAdapter(),
+                policy_features={
+                    "action": {
+                        "dtype": "float32",
+                        "shape": (14,),
+                        "names": list(BIMANUAL_EE_RPY_NAMES),
+                    },
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": (14,),
+                        "names": list(BIMANUAL_EE_RPY_NAMES),
+                    },
+                },
+                policy_observation_transform=lambda values: {
+                    **values,
+                    **bimanual_ee_quat_to_rpy_values(values),
+                },
+                ee_pose_storage=_EEPoseStorage(),
+                control_time_s=0.001,
+            )
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+    observation_state = captured_observation_frames[0]["observation.state"]
+    assert observation_state.shape == (14,)
+    assert observation_state[0] == pytest.approx(0.1)
+    assert observation_state[3] == pytest.approx(0.0)
+    assert observation_state[6] == pytest.approx(0.7)
+    assert observation_state[13] == pytest.approx(1.7)
 
 
 def test_record_loop_disables_stationary_bimanual_ee_quat_policy_arm(tmp_path):

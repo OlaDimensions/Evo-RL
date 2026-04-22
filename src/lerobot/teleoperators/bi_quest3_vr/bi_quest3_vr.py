@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from typing import Any
 
 from lerobot.processor import RobotAction
 from lerobot.utils.decorators import check_if_not_connected
@@ -44,6 +45,11 @@ class BiQuest3VRTeleop(Quest3VRTeleop):
     def prepare_episode_start(self) -> None:
         self._clear_arm_episode_state(self._left)
         self._clear_arm_episode_state(self._right)
+
+    def sync_from_observation(self, observation: dict[str, Any]) -> bool:
+        left_synced = self._sync_arm_from_observation(self._left, observation, prefix="left_")
+        right_synced = self._sync_arm_from_observation(self._right, observation, prefix="right_")
+        return left_synced or right_synced
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:

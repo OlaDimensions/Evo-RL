@@ -20,6 +20,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -71,6 +72,7 @@ class Quest3VRTeleop(Teleoperator):
         self._last_action_log_t = 0.0
         self._hz_window_start_t = 0.0
         self._frame_count = 0
+        self._sync_fk_backend: Any | None = None
 
     @property
     def action_features(self) -> dict:
@@ -179,6 +181,10 @@ class Quest3VRTeleop(Teleoperator):
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:  # noqa: ARG002
         return
+
+    def sync_from_observation(self, observation: dict[str, Any]) -> bool:
+        """Anchor the next VR enable to the robot's current measured EE pose."""
+        return self._sync_arm_from_observation(self._right, observation, prefix="")
 
     def prepare_episode_reset(self) -> None:
         """Make the next action trigger a safe IK reset to the configured initial pose."""
@@ -384,6 +390,65 @@ class Quest3VRTeleop(Teleoperator):
         if state.gripper_pos is not None:
             return float(state.gripper_pos)
         return self._gripper_value(state.gripper_open)
+
+    def _sync_arm_from_observation(self, state: ArmRuntime, observation: dict[str, Any], *, prefix: str) -> bool:
+        q = self._observation_joint_radians(observation, prefix=prefix)
+        if q is None:
+            logger.warning("[VR_HEALTH] cannot sync VR anchor from observation; missing/invalid %sPiper joints", prefix)
+            return False
+        try:
+            current_T = self._sync_fk(q)
+        except Exception as exc:
+            logger.warning("[VR_HEALTH] failed to sync VR anchor from observation: %s", exc)
+            return False
+
+        state.arm_T = current_T.copy()
+        state.last_T = current_T.copy()
+        state.base_T = None
+        logger.info(
+            "[VR_HEALTH] synced VR anchor from observation prefix=%s xyzrpy=%s",
+            prefix or "single",
+            np.array2string(self._matrix_to_xyzrpy(current_T), precision=5, suppress_small=True),
+        )
+        return True
+
+    def _observation_joint_radians(self, observation: dict[str, Any], *, prefix: str) -> np.ndarray | None:
+        from lerobot.utils.piper_sdk import PIPER_JOINT_ACTION_KEYS
+
+        values: list[float] = []
+        for key in PIPER_JOINT_ACTION_KEYS:
+            value = observation.get(f"{prefix}{key}")
+            if value is None:
+                return None
+            values.append(float(value))
+        q = np.deg2rad(np.asarray(values, dtype=np.float64))
+        if not np.isfinite(q).all():
+            return None
+        return q
+
+    def _sync_fk(self, q: np.ndarray) -> np.ndarray:
+        if self._sync_fk_backend is None:
+            self._sync_fk_backend = self._build_sync_fk_backend()
+        return np.asarray(self._sync_fk_backend.fk(q), dtype=np.float64)
+
+    def _build_sync_fk_backend(self) -> Any:
+        from .piper_pinocchio import PiperIKConfig, PiperPinocchioIKBackend
+
+        ik_cfg = PiperIKConfig(
+            urdf_path=Path(self.config.piper_urdf_path),
+            package_dir=Path(self.config.piper_package_dir),
+            ee_link_name=self.config.piper_ee_link_name,
+            ee_link_joint_name=self.config.piper_ee_link_joint_name,
+            locked_joint_names=self.config.piper_locked_joint_names,
+            ee_offset_xyzrpy=self.config.piper_ee_offset_xyzrpy,
+            enable_branch_stable_ik=self.config.enable_branch_stable_ik,
+            branch_trust_region_rad=tuple(math.radians(value) for value in self.config.branch_trust_region_deg),
+            pose_error_mode=self.config.ik_pose_error_mode,
+            max_position_error_m=self.config.ik_max_position_error_m,
+            max_orientation_error_rad=math.radians(self.config.ik_max_orientation_error_deg),
+            pose_error_log_interval_s=self.config.ik_pose_error_log_interval_s,
+        )
+        return PiperPinocchioIKBackend(ik_cfg)
 
     def _gripper_value(self, gripper_open: bool) -> float:
         return float(self.config.gripper_open_value if gripper_open else self.config.gripper_close_value)

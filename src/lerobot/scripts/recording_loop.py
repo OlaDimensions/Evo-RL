@@ -207,6 +207,7 @@ def record_loop(
     last_action_values_for_storage: RobotAction | None = None
     last_policy_action_for_enabled: RobotAction | None = None
     teleop_fallback_warned = False
+    pending_teleop_pose_sync = False
 
     teleop_arm_for_mode_switch: Any | None = None
     if isinstance(teleop, Teleoperator):
@@ -304,6 +305,7 @@ def record_loop(
             if intervention_enabled:
                 if intervention_state == INTERVENTION_STATE_POLICY:
                     intervention_state = INTERVENTION_STATE_ACTIVE
+                    pending_teleop_pose_sync = True
                     set_teleop_manual_control(True)
                     logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
                 else:
@@ -327,6 +329,19 @@ def record_loop(
 
         # Get robot observation
         obs = robot.get_observation()
+
+        if pending_teleop_pose_sync:
+            pending_teleop_pose_sync = False
+            sync_from_observation = getattr(teleop_arm_for_mode_switch, "sync_from_observation", None)
+            if callable(sync_from_observation):
+                try:
+                    synced = bool(sync_from_observation(obs))
+                    if synced:
+                        logging.info("Teleop VR anchor synced from current robot observation.")
+                    else:
+                        logging.warning("Teleop VR anchor sync was requested but no arm pose was updated.")
+                except Exception:
+                    logging.exception("Failed to sync teleop VR anchor from current robot observation.")
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
