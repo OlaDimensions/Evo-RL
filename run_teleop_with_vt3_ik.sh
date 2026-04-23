@@ -83,18 +83,19 @@ exec env \
   --robot.right_arm_config.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}' \
   --teleop.type=bi_quest3_vr \
   --teleop.id=my_bi_vr_leader \
-  --dataset.repo_id=ruanafan/eval_evo-rl-data-pnp-vr-ee-pose-round0-0418-pi05-12w-infer-1 \
+  --dataset.repo_id=ruanafan/eval_evo-rl-data-pnp-vr-ee-pose-round1-0421-all-rpy-infer-5 \
   --dataset.single_task="Locate and pull open the air fryer drawer, pick up the sweet potato and place it steadily into the basket, then push the drawer back." \
-  --dataset.num_episodes=20 \
+  --dataset.num_episodes=10 \
   --dataset.episode_time_s=100 \
   --dataset.reset_time_s=30 \
   --dataset.push_to_hub=false \
-  --display_data=true \
+  --display_data=false \
   --teleop.ik_pose_error_mode=reject \
   --teleop.ik_max_position_error_m=0.08 \
   --teleop.ik_max_orientation_error_deg=60 \
   --record_ee_pose=true \
-  --policy.path=outputs/train/pi05_0418/12w/pretrained_model/ \
+  --policy_action_schema=bimanual_ee_rpy \
+  --policy.path=outputs/train/pi05-vr-ee-pose-round0-0421-all-rpy/checkpoints/030000/pretrained_model/ \
   --policy_sync_to_teleop=true \
   --policy_sync_parallel=true
   # > teleop_with_vt3_ik_ee_pose.log 2>&1
@@ -120,3 +121,4 @@ exec env \
 
   # "$EVO_PY" -m lerobot.scripts.lerobot_teleoperate "$@"
   # lerobot-teleoperate     --robot.type=piper_follower     --robot.port=can_left     --teleop.type=quest3_vr  --fps=30
+

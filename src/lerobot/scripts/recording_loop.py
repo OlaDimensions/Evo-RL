@@ -43,7 +43,7 @@ from lerobot.scripts.recording_hil import (
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
-from lerobot.scripts.ee_pose_action_utils import with_bimanual_ee_enabled_flags
+from lerobot.scripts.ee_pose_action_utils import detect_bimanual_ee_schema, with_bimanual_ee_enabled_flags
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -110,6 +110,13 @@ def _complete_action_values_for_dataset(
             elif previous_values is not None and name in previous_values:
                 completed[name] = previous_values[name]
     return completed
+
+
+def _zero_values_for_feature(ds_features: dict[str, Any], feature_key: str) -> RobotAction:
+    feature = ds_features.get(feature_key)
+    if not feature or feature.get("dtype") != "float32" or len(feature.get("shape", ())) != 1:
+        return {}
+    return dict.fromkeys(feature.get("names", ()), 0.0)
 
 
 @safe_stop_image_writer
@@ -208,6 +215,7 @@ def record_loop(
     last_policy_action_for_enabled: RobotAction | None = None
     teleop_fallback_warned = False
     pending_teleop_pose_sync = False
+    pending_policy_release_baseline = False
 
     teleop_arm_for_mode_switch: Any | None = None
     if isinstance(teleop, Teleoperator):
@@ -318,6 +326,7 @@ def record_loop(
                         if policy_action_processor is not None:
                             policy_action_processor.reset()
                             last_policy_action_for_enabled = None
+                            pending_policy_release_baseline = True
                         if acp_inference.enable and acp_inference.use_cfg:
                             cond_policy_runtime_state = _capture_policy_runtime_state(policy)
                             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
@@ -387,11 +396,21 @@ def record_loop(
                 uncond_runtime_state=uncond_policy_runtime_state,
             )
             raw_policy_action_for_storage = make_robot_action(policy_action, features_for_policy)
-            policy_action_for_execution = with_bimanual_ee_enabled_flags(
-                raw_policy_action_for_storage,
-                last_policy_action_for_enabled,
-                policy_stationary_arm_delta_threshold,
-            )
+            if pending_policy_release_baseline and detect_bimanual_ee_schema(raw_policy_action_for_storage):
+                policy_action_for_execution = {
+                    **raw_policy_action_for_storage,
+                    "left_enabled": False,
+                    "right_enabled": False,
+                }
+                pending_policy_release_baseline = False
+                logging.info("Policy release baseline captured; suppressing bimanual EE motion for one tick.")
+            else:
+                policy_action_for_execution = with_bimanual_ee_enabled_flags(
+                    raw_policy_action_for_storage,
+                    last_policy_action_for_enabled,
+                    policy_stationary_arm_delta_threshold,
+                )
+                pending_policy_release_baseline = False
             last_policy_action_for_enabled = raw_policy_action_for_storage
             act_processed_policy = (
                 policy_action_processor((policy_action_for_execution, obs))
@@ -503,7 +522,9 @@ def record_loop(
                 elif selected_from_policy:
                     policy_action_values_for_frame = ee_action_after_action
                 else:
-                    policy_action_values_for_frame = ee_pose_storage.zero()
+                    policy_action_values_for_frame = _zero_values_for_feature(
+                        dataset.features, "complementary_info.policy_action"
+                    )
             else:
                 observation_values_for_storage = obs_processed
                 action_values_for_frame = action_values_for_storage

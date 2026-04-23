@@ -34,6 +34,12 @@ DEFAULT_COLUMNS = ("action", "observation.state", "complementary_info.policy_act
 EULER_FORMAT_RPY = "rpy"
 EULER_FORMAT_RXRYRZ = "rxryrz"
 EULER_FORMATS = (EULER_FORMAT_RPY, EULER_FORMAT_RXRYRZ)
+ROTATION_FORMAT_QUAT = "quat"
+ROTATION_SUFFIXES = {
+    ROTATION_FORMAT_QUAT: ("qx", "qy", "qz", "qw"),
+    EULER_FORMAT_RPY: ("roll", "pitch", "yaw"),
+    EULER_FORMAT_RXRYRZ: ("rx", "ry", "rz"),
+}
 
 
 def quaternion_xyzw_to_rpy(quat: np.ndarray) -> np.ndarray:
@@ -44,6 +50,48 @@ def quaternion_xyzw_to_rpy(quat: np.ndarray) -> np.ndarray:
 def quaternion_xyzw_to_rxryrz(quat: np.ndarray) -> np.ndarray:
     """Convert one quaternion `[x, y, z, w]` to XYZ Euler `[rx, ry, rz]` in radians."""
     return rotation_matrix_to_rxryrz(quaternion_xyzw_to_rotation_matrix(quat))
+
+
+def rpy_to_rotation_matrix(rpy: np.ndarray) -> np.ndarray:
+    """Convert RPY `[roll, pitch, yaw]` to a matrix for `R = Rz(yaw) * Ry(pitch) * Rx(roll)`."""
+    roll, pitch, yaw = np.asarray(rpy, dtype=np.float64)
+    sr, cr = np.sin(roll), np.cos(roll)
+    sp, cp = np.sin(pitch), np.cos(pitch)
+    sy, cy = np.sin(yaw), np.cos(yaw)
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=np.float64,
+    )
+
+
+def rxryrz_to_rotation_matrix(rxryrz: np.ndarray) -> np.ndarray:
+    """Convert XYZ Euler `[rx, ry, rz]` to a matrix for `R = Rx(rx) * Ry(ry) * Rz(rz)`."""
+    rx, ry, rz = np.asarray(rxryrz, dtype=np.float64)
+    sa, ca = np.sin(rx), np.cos(rx)
+    sb, cb = np.sin(ry), np.cos(ry)
+    sc, cc = np.sin(rz), np.cos(rz)
+    return np.array(
+        [
+            [cb * cc, -cb * sc, sb],
+            [sa * sb * cc + ca * sc, -sa * sb * sc + ca * cc, -sa * cb],
+            [-ca * sb * cc + sa * sc, ca * sb * sc + sa * cc, ca * cb],
+        ],
+        dtype=np.float64,
+    )
+
+
+def rpy_to_rxryrz(rpy: np.ndarray) -> np.ndarray:
+    """Convert one RPY vector `[roll, pitch, yaw]` to XYZ Euler `[rx, ry, rz]` in radians."""
+    return rotation_matrix_to_rxryrz(rpy_to_rotation_matrix(rpy))
+
+
+def rxryrz_to_rpy(rxryrz: np.ndarray) -> np.ndarray:
+    """Convert one XYZ Euler vector `[rx, ry, rz]` to RPY `[roll, pitch, yaw]` in radians."""
+    return rotation_matrix_to_rpy(rxryrz_to_rotation_matrix(rxryrz))
 
 
 def quaternion_xyzw_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
@@ -81,25 +129,65 @@ def rotation_matrix_to_rxryrz(matrix: np.ndarray) -> np.ndarray:
     return np.array([rx, ry, rz], dtype=np.float32)
 
 
-def euler_names_from_quaternion_names(names: list[str], euler_format: str = EULER_FORMAT_RPY) -> list[str]:
+def _rotation_group_at(names: list[str], index: int) -> tuple[str, str, int] | None:
+    name = names[index]
+    if "." not in name:
+        return None
+
+    prefix, suffix = name.rsplit(".", 1)
+    for rotation_format, suffixes in ROTATION_SUFFIXES.items():
+        expected = [f"{prefix}.{group_suffix}" for group_suffix in suffixes]
+        if suffix == suffixes[0]:
+            actual = names[index : index + len(suffixes)]
+            if actual != expected:
+                raise ValueError(f"{rotation_format} names must be contiguous as {expected}, got {actual}")
+            return rotation_format, prefix, len(suffixes)
+        if suffix in suffixes[1:]:
+            raise ValueError(f"Rotation names must start with {expected[0]!r}, got {name!r}")
+
+    return None
+
+
+def pose_rotation_format(names: list[str]) -> str | None:
+    formats: set[str] = set()
+    index = 0
+    while index < len(names):
+        group = _rotation_group_at(names, index)
+        if group is None:
+            index += 1
+            continue
+        rotation_format, _, width = group
+        formats.add(rotation_format)
+        index += width
+
+    if not formats:
+        return None
+    if len(formats) > 1:
+        raise ValueError(f"Pose feature mixes rotation formats {sorted(formats)}")
+    return next(iter(formats))
+
+
+def euler_names_from_pose_names(names: list[str], euler_format: str = EULER_FORMAT_RPY) -> list[str]:
     if euler_format not in EULER_FORMATS:
         raise ValueError(f"`euler_format` must be one of {EULER_FORMATS}, got {euler_format!r}.")
-    suffixes = (".roll", ".pitch", ".yaw") if euler_format == EULER_FORMAT_RPY else (".rx", ".ry", ".rz")
+    suffixes = ROTATION_SUFFIXES[euler_format]
     converted: list[str] = []
     index = 0
     while index < len(names):
-        name = names[index]
-        if name.endswith(".qx"):
-            quat_names = names[index : index + 4]
-            expected = [name[:-3] + suffix for suffix in (".qx", ".qy", ".qz", ".qw")]
-            if quat_names != expected:
-                raise ValueError(f"Quaternion names must be contiguous as {expected}, got {quat_names}")
-            converted.extend([name[:-3] + suffix for suffix in suffixes])
-            index += 4
-        else:
-            converted.append(name)
+        group = _rotation_group_at(names, index)
+        if group is None:
+            converted.append(names[index])
             index += 1
+            continue
+
+        _, prefix, width = group
+        converted.extend([f"{prefix}.{suffix}" for suffix in suffixes])
+        index += width
     return converted
+
+
+def euler_names_from_quaternion_names(names: list[str], euler_format: str = EULER_FORMAT_RPY) -> list[str]:
+    return euler_names_from_pose_names(names, euler_format)
 
 
 def rpy_names_from_quaternion_names(names: list[str]) -> list[str]:
@@ -122,19 +210,30 @@ def convert_pose_batch(values: np.ndarray, names: list[str], euler_format: str =
     parts: list[np.ndarray] = []
     index = 0
     while index < len(names):
-        name = names[index]
-        if name.endswith(".qx"):
-            quat_names = names[index : index + 4]
-            expected = [name[:-3] + suffix for suffix in (".qx", ".qy", ".qz", ".qw")]
-            if quat_names != expected:
-                raise ValueError(f"Quaternion values must be contiguous as {expected}, got {quat_names}")
-            converter = quaternion_xyzw_to_rpy if euler_format == EULER_FORMAT_RPY else quaternion_xyzw_to_rxryrz
-            euler = np.stack([converter(quat) for quat in values[:, index : index + 4]])
-            parts.append(euler)
-            index += 4
-        else:
+        group = _rotation_group_at(names, index)
+        if group is None:
             parts.append(values[:, index : index + 1])
             index += 1
+            continue
+
+        source_format, _, width = group
+        source_values = values[:, index : index + width]
+        if source_format == euler_format:
+            parts.append(source_values)
+        else:
+            if source_format == ROTATION_FORMAT_QUAT and euler_format == EULER_FORMAT_RPY:
+                converter = quaternion_xyzw_to_rpy
+            elif source_format == ROTATION_FORMAT_QUAT and euler_format == EULER_FORMAT_RXRYRZ:
+                converter = quaternion_xyzw_to_rxryrz
+            elif source_format == EULER_FORMAT_RPY and euler_format == EULER_FORMAT_RXRYRZ:
+                converter = rpy_to_rxryrz
+            elif source_format == EULER_FORMAT_RXRYRZ and euler_format == EULER_FORMAT_RPY:
+                converter = rxryrz_to_rpy
+            else:
+                raise ValueError(f"Unsupported rotation conversion {source_format!r} -> {euler_format!r}")
+            euler = np.stack([converter(rotation) for rotation in source_values])
+            parts.append(euler)
+        index += width
 
     return np.concatenate(parts, axis=1).astype(np.float32)
 
@@ -160,21 +259,30 @@ def _converted_features(
 ) -> tuple[dict, dict[str, list[str]]]:
     features = dict(info["features"])
     source_names: dict[str, list[str]] = {}
+    found_feature = False
     for column in columns:
         if column not in features:
             logging.info("Skipping missing feature %s", column)
             continue
+        found_feature = True
         feature = dict(features[column])
         names = list(feature.get("names") or [])
         if not names:
-            raise ValueError(f"Feature {column} has no names; cannot locate quaternion fields")
-        new_names = euler_names_from_quaternion_names(names, euler_format)
-        if len(new_names) == len(names):
-            raise ValueError(f"Feature {column} does not contain quaternion names ending in .qx/.qy/.qz/.qw")
+            raise ValueError(f"Feature {column} has no names; cannot locate pose rotation fields")
+        source_format = pose_rotation_format(names)
+        if source_format is None:
+            raise ValueError(f"Feature {column} does not contain recognized pose rotation fields")
+        if source_format == euler_format:
+            logging.info("Keeping feature %s unchanged; already uses %s rotations", column, euler_format)
+            continue
+
+        new_names = euler_names_from_pose_names(names, euler_format)
         feature["names"] = new_names
         feature["shape"] = (len(new_names),)
         features[column] = feature
         source_names[column] = names
+    if not found_feature:
+        raise ValueError("None of the requested columns were found in the dataset")
     info = dict(info)
     info["features"] = features
     return info, source_names
@@ -266,21 +374,22 @@ def convert_dataset(
 
     info = load_info(dst_root)
     new_info, source_names = _converted_features(info, columns, euler_format=euler_format)
-    if not source_names:
-        raise ValueError("None of the requested columns were found in the dataset")
     write_info(new_info, dst_root)
 
-    all_arrays, episode_arrays = _rewrite_data_files(
-        dst_root,
-        new_info["features"],
-        source_names,
-        euler_format=euler_format,
-    )
-    dataset_stats = _stats_for_arrays(all_arrays)
-    episode_stats = {ep_idx: _stats_for_arrays(arrays) for ep_idx, arrays in episode_arrays.items()}
+    if source_names:
+        all_arrays, episode_arrays = _rewrite_data_files(
+            dst_root,
+            new_info["features"],
+            source_names,
+            euler_format=euler_format,
+        )
+        dataset_stats = _stats_for_arrays(all_arrays)
+        episode_stats = {ep_idx: _stats_for_arrays(arrays) for ep_idx, arrays in episode_arrays.items()}
 
-    _rewrite_dataset_stats(dst_root, dataset_stats)
-    _rewrite_episode_stats(dst_root, episode_stats)
+        _rewrite_dataset_stats(dst_root, dataset_stats)
+        _rewrite_episode_stats(dst_root, episode_stats)
+    else:
+        logging.info("All requested pose columns already use %s rotations; no parquet rewrite needed", euler_format)
 
     # Validate the final copy can be loaded by LeRobot.
     LeRobotDataset(dst_repo_id, root=dst_root)

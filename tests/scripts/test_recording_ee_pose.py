@@ -2,10 +2,13 @@ import math
 
 import pytest
 
+from lerobot.datasets.utils import build_dataset_frame
+from lerobot.scripts.ee_pose_action_utils import BIMANUAL_EE_RPY_NAMES
 from lerobot.scripts.recording_ee_pose import (
     PiperEEPoseStorage,
     replace_low_dim_features_with_piper_ee_pose,
 )
+from lerobot.scripts.recording_loop import _zero_values_for_feature
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -127,6 +130,22 @@ def test_replace_low_dim_features_with_piper_ee_pose_updates_state_action_and_po
     ]
     assert features[OBS_STATE] == features[ACTION]
     assert features["complementary_info.policy_action"] == features[ACTION]
+
+
+def test_zero_policy_action_uses_rpy_policy_action_schema_names():
+    features = {
+        "complementary_info.policy_action": {
+            "dtype": "float32",
+            "shape": (len(BIMANUAL_EE_RPY_NAMES),),
+            "names": list(BIMANUAL_EE_RPY_NAMES),
+        }
+    }
+
+    values = _zero_values_for_feature(features, "complementary_info.policy_action")
+    frame = build_dataset_frame(features, values, prefix="complementary_info.policy_action")
+
+    assert set(values) == set(BIMANUAL_EE_RPY_NAMES)
+    assert frame["complementary_info.policy_action"].shape == (len(BIMANUAL_EE_RPY_NAMES),)
 
 
 def test_single_piper_quaternion_sign_is_continuous():

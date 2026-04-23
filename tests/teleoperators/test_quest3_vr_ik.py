@@ -76,6 +76,15 @@ def _action_target_T(action):
     return Quest3VRTeleop._xyzrpy_to_matrix(*[float(action[key]) for key in keys])
 
 
+def _piper_joint_observation(prefix: str = "", gripper_pos: float = 0.0) -> dict[str, float]:
+    observation = {
+        f"{prefix}{key}": float(idx + 1)
+        for idx, key in enumerate(PIPER_JOINT_ACTION_KEYS)
+    }
+    observation[f"{prefix}gripper.pos"] = float(gripper_pos)
+    return observation
+
+
 @pytest.mark.slow
 def test_piper_pinocchio_ik_solve_returns_valid_solution():
     PiperIKConfig, PiperPinocchioIKBackend = _piper_backend_classes_or_skip()
@@ -1132,6 +1141,39 @@ def test_quest3_vr_prepare_episode_start_drops_retained_vr_state():
     np.testing.assert_allclose(teleop._right.last_T, teleop._arm_init_T, atol=1e-12)
 
 
+def test_quest3_vr_sync_from_observation_keeps_current_gripper_state():
+    cfg = Quest3VRTeleopConfig()
+    teleop = Quest3VRTeleop(cfg)
+    current_T = _raw_quest_T(0.2, 0.1, 0.3)
+    teleop._sync_fk = lambda q: current_T
+    observation = _piper_joint_observation(gripper_pos=cfg.gripper_close_value)
+
+    assert teleop.sync_from_observation(observation) is True
+
+    assert teleop._right.gripper_pos == pytest.approx(cfg.gripper_close_value, abs=1e-9)
+    assert teleop._right.gripper_open is False
+    np.testing.assert_allclose(teleop._right.last_T, current_T, atol=1e-12)
+
+
+def test_quest3_vr_synced_closed_gripper_toggles_open_on_next_trigger_press():
+    cfg = Quest3VRTeleopConfig()
+    teleop = Quest3VRTeleop(cfg)
+    teleop._sync_fk = lambda q: _raw_quest_T()
+    assert teleop.sync_from_observation(_piper_joint_observation(gripper_pos=cfg.gripper_close_value)) is True
+
+    action = teleop._arm_action(
+        controller_T=_raw_quest_T(),
+        buttons={"B": True, "A": False, "rightTrig": (1.0,)},
+        state=teleop._right,
+        enable_button=cfg.enable_button,
+        reset_button=cfg.reset_button,
+        gripper_button=cfg.gripper_button,
+    )
+
+    assert action["gripper.pos"] == pytest.approx(cfg.gripper_open_value, abs=1e-9)
+    assert teleop._right.gripper_open is True
+
+
 def test_quest3_vr_single_arm_toggles_gripper_on_b_trigger_same_sample():
     cfg = Quest3VRTeleopConfig()
     teleop = Quest3VRTeleop(cfg)
@@ -1185,3 +1227,18 @@ def test_quest3_vr_dual_arm_contract_outputs_prefixed_actions():
     out = teleop.get_action()
     assert "left_enabled" in out and "right_enabled" in out
     assert "left_ee.delta_x" in out and "right_ee.delta_x" in out
+
+
+def test_quest3_vr_dual_arm_sync_from_observation_keeps_each_gripper_state():
+    cfg = BiQuest3VRTeleopConfig(calibration_dir=Path("/tmp/lerobot_test_calib_bi_quest3_vr"))
+    teleop = BiQuest3VRTeleop(cfg)
+    teleop._sync_fk = lambda q: _raw_quest_T()
+    observation = {
+        **_piper_joint_observation(prefix="left_", gripper_pos=11.0),
+        **_piper_joint_observation(prefix="right_", gripper_pos=88.0),
+    }
+
+    assert teleop.sync_from_observation(observation) is True
+
+    assert teleop._left.gripper_pos == pytest.approx(11.0, abs=1e-9)
+    assert teleop._right.gripper_pos == pytest.approx(88.0, abs=1e-9)

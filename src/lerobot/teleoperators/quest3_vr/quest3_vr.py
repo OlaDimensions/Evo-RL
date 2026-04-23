@@ -405,12 +405,25 @@ class Quest3VRTeleop(Teleoperator):
         state.arm_T = current_T.copy()
         state.last_T = current_T.copy()
         state.base_T = None
+        self._sync_gripper_from_observation(state, observation, prefix=prefix)
         logger.info(
             "[VR_HEALTH] synced VR anchor from observation prefix=%s xyzrpy=%s",
             prefix or "single",
             np.array2string(self._matrix_to_xyzrpy(current_T), precision=5, suppress_small=True),
         )
         return True
+
+    def _sync_gripper_from_observation(self, state: ArmRuntime, observation: dict[str, Any], *, prefix: str) -> None:
+        value = observation.get(f"{prefix}gripper.pos")
+        if value is None:
+            return
+        gripper_pos = float(value)
+        if not math.isfinite(gripper_pos):
+            return
+        state.gripper_pos = gripper_pos
+        open_distance = abs(gripper_pos - self.config.gripper_open_value)
+        close_distance = abs(gripper_pos - self.config.gripper_close_value)
+        state.gripper_open = open_distance <= close_distance
 
     def _observation_joint_radians(self, observation: dict[str, Any], *, prefix: str) -> np.ndarray | None:
         from lerobot.utils.piper_sdk import PIPER_JOINT_ACTION_KEYS
