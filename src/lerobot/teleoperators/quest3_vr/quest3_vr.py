@@ -407,9 +407,15 @@ class Quest3VRTeleop(Teleoperator):
         state.base_T = None
         self._sync_gripper_from_observation(state, observation, prefix=prefix)
         logger.info(
-            "[VR_HEALTH] synced VR anchor from observation prefix=%s xyzrpy=%s",
+            "[VR_HEALTH] synced VR anchor from observation prefix=%s xyzrpy=%s retained_state=%s",
             prefix or "single",
             np.array2string(self._matrix_to_xyzrpy(current_T), precision=5, suppress_small=True),
+            {
+                "raw_T": state.raw_T is not None,
+                "smooth_T": state.smooth_T is not None,
+                "base_T": state.base_T is not None,
+                "enable_prev": state.enable_prev,
+            },
         )
         return True
 
@@ -539,7 +545,7 @@ class Quest3VRTeleop(Teleoperator):
         if all(key in action for key in target_keys):
             target_xyzrpy = np.array([float(action[key]) for key in target_keys], dtype=np.float64)
             target_T = self._xyzrpy_to_matrix(*target_xyzrpy.tolist())
-            logger.info(
+            logger.debug(
                 "[VR_TRACE] enabled=%s reset=%s gripper=%.3f target_xyzrpy=%s target_T=%s",
                 bool(action.get("enabled", False)),
                 bool(action.get("reset", False)),
@@ -558,7 +564,7 @@ class Quest3VRTeleop(Teleoperator):
             "ee.delta_rz",
         ]
         delta = np.array([float(action.get(key, 0.0)) for key in delta_keys], dtype=np.float64)
-        logger.info(
+        logger.debug(
             "[VR_TRACE] enabled=%s reset=%s gripper=%.3f delta=%s keys=%s",
             bool(action.get("enabled", False)),
             bool(action.get("reset", False)),
@@ -588,7 +594,7 @@ class Quest3VRTeleop(Teleoperator):
         if now - state.last_motion_diag_log_t < self.config.log_diagnostics_interval_s:
             return
         state.last_motion_diag_log_t = now
-        logger.info(
+        logger.debug(
             "[VR_DIAG] enabled=%s reset_edge=%s dead_zone=%s raw_step_pos=%.6f raw_step_rot=%.6f "
             "smooth_step_pos=%.6f smooth_step_rot=%.6f base_dp=%s base_dr=%s delta_pos=%s delta_rot=%s target_xyzrpy=%s",
             enable_now,
@@ -615,7 +621,7 @@ class Quest3VRTeleop(Teleoperator):
         self._frame_count += 1
         span = now - self._hz_window_start_t
         if span >= 1.0:
-            logger.info("[VR_HEALTH] output_hz=%.1f", self._frame_count / span)
+            logger.debug("[VR_HEALTH] output_hz=%.1f", self._frame_count / span)
             self._frame_count = 0
             self._hz_window_start_t = now
 

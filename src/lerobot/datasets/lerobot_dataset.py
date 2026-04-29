@@ -544,12 +544,31 @@ class LeRobotDatasetMetadata:
         return obj
 
 
+def _count_image_frames(img_dir: Path) -> int:
+    template = "frame-" + ("[0-9]" * 6) + ".png"
+    return len(list(img_dir.glob(template)))
+
+
 def _encode_video_worker(
-    video_key: str, episode_index: int, root: Path, fps: int, vcodec: str = "libsvtav1"
+    video_key: str,
+    episode_index: int,
+    root: Path,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    expected_num_frames: int | None = None,
 ) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
+    if expected_num_frames is not None:
+        actual_num_frames = _count_image_frames(img_dir)
+        if actual_num_frames != expected_num_frames:
+            shutil.rmtree(temp_path.parent)
+            raise RuntimeError(
+                "Unexpected number of temporary frames while encoding episode video: "
+                f"video_key={video_key!r}, episode_index={episode_index}, "
+                f"expected={expected_num_frames}, actual={actual_num_frames}, img_dir={img_dir}"
+            )
     encode_video_frames(img_dir, temp_path, fps, vcodec=vcodec, overwrite=True)
     shutil.rmtree(img_dir)
     return temp_path
@@ -1181,6 +1200,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
                 )
                 if frame_index == 0:
+                    if img_path.parent.is_dir():
+                        shutil.rmtree(img_path.parent)
                     img_path.parent.mkdir(parents=True, exist_ok=True)
                 compress_level = 1 if self.features[key]["dtype"] == "video" else 6
                 self._save_image(frame[key], img_path, compress_level)
@@ -1262,6 +1283,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                             self.root,
                             self.fps,
                             self.vcodec,
+                            episode_length,
                         ): video_key
                         for video_key in self.meta.video_keys
                     }
@@ -1283,7 +1305,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     )
             else:
                 for video_key in self.meta.video_keys:
-                    ep_metadata.update(self._save_episode_video(video_key, episode_index))
+                    ep_metadata.update(
+                        self._save_episode_video(
+                            video_key,
+                            episode_index,
+                            expected_num_frames=episode_length,
+                        )
+                    )
 
         # `meta.save_episode` need to be executed after encoding the videos
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
@@ -1344,7 +1372,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Save the current episode's video metadata to the dataframe
             video_ep_metadata = {}
             for video_key in self.meta.video_keys:
-                video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
+                video_ep_metadata.update(
+                    self._save_episode_video(
+                        video_key,
+                        ep_idx,
+                        expected_num_frames=int(self.meta.episodes[ep_idx]["length"]),
+                    )
+                )
             video_ep_metadata.pop("episode_index")
             video_ep_df = pd.DataFrame(video_ep_metadata, index=[ep_idx]).convert_dtypes(
                 dtype_backend="pyarrow"
@@ -1453,10 +1487,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         video_key: str,
         episode_index: int,
         temp_path: Path | None = None,
+        expected_num_frames: int | None = None,
     ) -> dict:
         # Encode episode frames into a temporary video
         if temp_path is None:
-            ep_path = self._encode_temporary_episode_video(video_key, episode_index)
+            ep_path = self._encode_temporary_episode_video(video_key, episode_index, expected_num_frames)
         else:
             ep_path = temp_path
 
@@ -1538,7 +1573,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             episode_index = self.episode_buffer["episode_index"]
             if isinstance(episode_index, np.ndarray):
                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            for cam_key in self.meta.image_keys:
+            for cam_key in self.meta.camera_keys:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)
@@ -1571,13 +1606,31 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_writer is not None:
             self.image_writer.wait_until_done()
 
-    def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
+    def _encode_temporary_episode_video(
+        self, video_key: str, episode_index: int, expected_num_frames: int | None = None
+    ) -> Path:
         """
         Use ffmpeg to convert frames stored as png into mp4 videos.
         Note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
         since video encoding with ffmpeg is already using multithreading.
         """
-        return _encode_video_worker(video_key, episode_index, self.root, self.fps, self.vcodec)
+        if self.meta.episodes is not None and episode_index < len(self.meta.episodes):
+            expected_num_frames = int(self.meta.episodes[episode_index]["length"])
+        elif (
+            expected_num_frames is None
+            and self.episode_buffer is not None
+            and self.episode_buffer["episode_index"] == episode_index
+            and "size" in self.episode_buffer
+        ):
+            expected_num_frames = int(self.episode_buffer["size"])
+        return _encode_video_worker(
+            video_key,
+            episode_index,
+            self.root,
+            self.fps,
+            self.vcodec,
+            expected_num_frames,
+        )
 
     @classmethod
     def create(

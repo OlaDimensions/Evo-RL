@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run lerobot teleoperation with vt3 IK stack (pinocchio/casadi/eigenpy/hppfcl)
-# injected only for this process.
-#
-# Usage:
-#   conda activate evo-rl-test
-#   ./run_teleop_with_vt3_ik.sh --robot.type=... --teleop.type=quest3_vr
-#
-# Optional:
-#   ./run_teleop_with_vt3_ik.sh --check-only
-
 VT3_ROOT="${VT3_ROOT:-/home/ola/miniforge3/envs/vt3}"
 VT3_SITE="${VT3_SITE:-$VT3_ROOT/lib/python3.10/site-packages}"
 EVO_PY="${EVO_PY:-python}"
@@ -41,7 +31,6 @@ fi
 
 _check_stack
 
-# rm -rf /home/ola/.cache/huggingface/lerobot/ruanafan/evo-rl-data-pnp-vr-test-ee-pose
 
 # exec env \
 #   PYTHONPATH="$VT3_SITE:${PYTHONPATH:-}" \
@@ -57,17 +46,22 @@ _check_stack
 #   --robot.right_arm_config.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}' \
 #   --teleop.type=bi_quest3_vr \
 #   --teleop.id=my_bi_vr_leader \
-#   --dataset.repo_id=ruanafan/evo-rl-data-pnp-vr-test-ee-pose \
-#   --dataset.single_task="Pick up the white bottle and insert it into the middle of the tape roll" \
-#   --dataset.num_episodes=2 \
-#   --dataset.episode_time_s=70 \
-#   --dataset.reset_time_s=15 \
+#   --dataset.repo_id=ruanafan/eval_evo-rl-data-pnp-vr-ee-pose-round1-0421-all-rpy-infer-5 \
+#   --dataset.single_task="Locate and pull open the air fryer drawer, pick up the sweet potato and place it steadily into the basket, then push the drawer back." \
+#   --dataset.num_episodes=10 \
+#   --dataset.episode_time_s=100 \
+#   --dataset.reset_time_s=30 \
 #   --dataset.push_to_hub=false \
-#   --display_data=true \
+#   --display_data=false \
 #   --teleop.ik_pose_error_mode=reject \
 #   --teleop.ik_max_position_error_m=0.08 \
 #   --teleop.ik_max_orientation_error_deg=60 \
-#   --record_ee_pose=true
+#   --record_ee_pose=true \
+#   --policy_action_schema=bimanual_ee_rpy \
+#   --policy.path=outputs/train/pi05-vr-ee-pose-round0-0421-all-rpy/checkpoints/030000/pretrained_model/ \
+#   --policy_sync_to_teleop=true \
+#   --policy_sync_parallel=true
+
 
 exec env \
   PYTHONPATH="$VT3_SITE:${PYTHONPATH:-}" \
@@ -83,42 +77,31 @@ exec env \
   --robot.right_arm_config.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}' \
   --teleop.type=bi_quest3_vr \
   --teleop.id=my_bi_vr_leader \
-  --dataset.repo_id=ruanafan/eval_evo-rl-data-pnp-vr-ee-pose-round1-0421-all-rpy-infer-5 \
+  --dataset.repo_id=ruanafan/eval_evo-rl-data-pnp-vr-ee-pose-round1-sweet-potato-0426-all-drop-last-frame-infer-1 \
   --dataset.single_task="Locate and pull open the air fryer drawer, pick up the sweet potato and place it steadily into the basket, then push the drawer back." \
   --dataset.num_episodes=10 \
-  --dataset.episode_time_s=100 \
-  --dataset.reset_time_s=30 \
+  --dataset.episode_time_s=150 \
+  --dataset.reset_time_s=20 \
   --dataset.push_to_hub=false \
   --display_data=false \
   --teleop.ik_pose_error_mode=reject \
   --teleop.ik_max_position_error_m=0.08 \
   --teleop.ik_max_orientation_error_deg=60 \
+  --policy_tighten_closed_gripper=true \
+  --policy_gripper_tighten_enter_threshold=50 \
+  --policy_gripper_tighten_release_threshold=65 \
   --record_ee_pose=true \
   --policy_action_schema=bimanual_ee_rpy \
-  --policy.path=outputs/train/pi05-vr-ee-pose-round0-0421-all-rpy/checkpoints/030000/pretrained_model/ \
   --policy_sync_to_teleop=true \
-  --policy_sync_parallel=true
-  # > teleop_with_vt3_ik_ee_pose.log 2>&1
-  
-  # lerobot-human-inloop-record  \  #single
-  # --robot.type=piper_follower     \
-  # --robot.id=my_piper_follower     \
-  # --robot.port=can_left     \
-  # --robot.require_calibration=false     \
-  # --robot.cameras='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height": 480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height": 480, "fps": 30, "warmup_s": 2}}'     \
-  # --teleop.type=quest3_vr     \
-  # --teleop.id=my_vr_leader     \
-  # --dataset.repo_id=ruanafan/evo-rl-data-pnp-vr-test     \
-  # --dataset.single_task="Pick up the white bottle and insert it into the middle of the tape roll"     \
-  # --dataset.num_episodes=2     \
-  # --dataset.episode_time_s=30     \
-  # --dataset.reset_time_s=5     \
-  # --dataset.push_to_hub=false     \
-  # --display_data=false
+  --policy_sync_parallel=true \
+  --policy.type=openpi_remote \
+  --policy.host=127.0.0.1 \
+  --policy.port=8000 \
+  --acp_inference.enable=true
+  # --acp_inference.use_cfg=true \
+  # --acp_inference.cfg_beta=1.0
+  #> run_teleop_with_vt3_ik.log 2>&1
 
-  # lerobot-teleoperate     --robot.type=piper_follower     --robot.port=can_left     --teleop.type=quest3_vr  --fps=30
+  # --policy.path=outputs/train/pi05-vr-ee-pose-round0-0421-all-rpy/checkpoints/030000/pretrained_model/
 
-
-  # "$EVO_PY" -m lerobot.scripts.lerobot_teleoperate "$@"
-  # lerobot-teleoperate     --robot.type=piper_follower     --robot.port=can_left     --teleop.type=quest3_vr  --fps=30
 

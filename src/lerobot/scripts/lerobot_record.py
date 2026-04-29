@@ -114,10 +114,13 @@ from lerobot.scripts.recording_ee_pose import (
 from lerobot.scripts.ee_pose_action_utils import (
     ACTION_SCHEMA_NAMES,
     BIMANUAL_EE_RPY_NAMES,
+    BIMANUAL_EE_ROTVEC_NAMES,
     MapPolicyQuatActionToRPYStep,
     MapPolicyRPYActionToIKTargetsStep,
+    MapPolicyRotVecActionToRPYStep,
     MapPolicyRXRYRZActionToRPYStep,
     SDK_EE_OFFSET_XYZRPY,
+    bimanual_ee_quat_to_rotvec_values,
     bimanual_ee_quat_to_rpy_values,
     detect_action_schema_from_names,
 )
@@ -267,6 +270,14 @@ class RecordConfig:
     policy_action_schema: str = "bimanual_ee_quat"
     # Treat a bimanual EE-pose policy arm as stationary when its per-frame action delta is at or below this.
     policy_stationary_arm_delta_threshold: float = 1e-5
+    # Tighten policy gripper close commands after inference using hysteresis.
+    policy_tighten_closed_gripper: bool = False
+    policy_gripper_tighten_enter_threshold: float = 40.0
+    policy_gripper_tighten_release_threshold: float = 55.0
+    policy_gripper_tighten_value: float = 0.0
+    # Emit compact handoff diagnostics for the first N frames after intervention toggles.
+    handoff_debug_enabled: bool = True
+    handoff_debug_log_frames: int = 8
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -318,10 +329,27 @@ class RecordConfig:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
         if self.policy_stationary_arm_delta_threshold < 0:
             raise ValueError("`policy_stationary_arm_delta_threshold` must be >= 0.")
-        if self.record_ee_pose and self.policy_action_schema not in {"bimanual_ee_quat", "bimanual_ee_rpy"}:
+        if self.policy_gripper_tighten_enter_threshold < 0:
+            raise ValueError("`policy_gripper_tighten_enter_threshold` must be >= 0.")
+        if self.policy_gripper_tighten_release_threshold <= self.policy_gripper_tighten_enter_threshold:
+            raise ValueError(
+                "`policy_gripper_tighten_release_threshold` must be greater than "
+                "`policy_gripper_tighten_enter_threshold`."
+            )
+        if self.policy_gripper_tighten_value < 0:
+            raise ValueError("`policy_gripper_tighten_value` must be >= 0.")
+        if not isinstance(self.handoff_debug_enabled, bool):
+            raise ValueError("`handoff_debug_enabled` must be true or false.")
+        if self.handoff_debug_log_frames < 0:
+            raise ValueError("`handoff_debug_log_frames` must be >= 0.")
+        if self.record_ee_pose and self.policy_action_schema not in {
+            "bimanual_ee_quat",
+            "bimanual_ee_rpy",
+            "bimanual_ee_rotvec",
+        }:
             raise ValueError(
                 "`record_ee_pose=true` requires `policy_action_schema` to be one of "
-                "['bimanual_ee_quat', 'bimanual_ee_rpy']."
+                "['bimanual_ee_quat', 'bimanual_ee_rpy', 'bimanual_ee_rotvec']."
             )
 
     @classmethod
@@ -392,6 +420,10 @@ def _policy_features_with_action_names(
 
 def _bimanual_ee_rpy_policy_observation(values: dict[str, Any]) -> dict[str, Any]:
     return {**values, **bimanual_ee_quat_to_rpy_values(values)}
+
+
+def _bimanual_ee_rotvec_policy_observation(values: dict[str, Any]) -> dict[str, Any]:
+    return {**values, **bimanual_ee_quat_to_rotvec_values(values)}
 
 
 def _set_policy_action_schema(features: dict[str, dict], action_names: tuple[str, ...]) -> None:
@@ -521,6 +553,20 @@ def _make_policy_action_processor_for_ee_schema(
         return _make_policy_action_processor_for_ee_pose(cfg)
     if policy_action_schema == "bimanual_ee_rpy":
         return _make_policy_action_processor_for_rpy_schema(policy_action_names, robot)
+    if policy_action_schema == "bimanual_ee_rotvec":
+        if not (
+            hasattr(robot, "left_arm")
+            and hasattr(robot, "right_arm")
+            or getattr(robot, "name", None) in {"bi_piper_follower", "bi_piper_x_follower"}
+        ):
+            raise ValueError("bimanual_ee_rotvec policy actions require a bimanual Piper/PiperX follower robot.")
+        ik_processor = make_bi_quest3_vr_robot_action_processor_from_config(
+            BiQuest3VRTeleopConfig(piper_ee_offset_xyzrpy=SDK_EE_OFFSET_XYZRPY)
+        )
+        return _compose_policy_action_processor(
+            [MapPolicyRotVecActionToRPYStep(bimanual=True), MapPolicyRPYActionToIKTargetsStep(bimanual=True)],
+            ik_processor,
+        )
     if policy_action_schema == "single_ee_rxryrz":
         ik_processor = make_quest3_vr_robot_action_processor_from_config(
             Quest3VRTeleopConfig(piper_ee_offset_xyzrpy=SDK_EE_OFFSET_XYZRPY)
@@ -599,6 +645,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         replace_low_dim_features_with_piper_ee_pose(dataset_features, robot)
         if cfg.policy_action_schema == "bimanual_ee_rpy":
             _set_policy_action_schema(dataset_features, BIMANUAL_EE_RPY_NAMES)
+        if cfg.policy_action_schema == "bimanual_ee_rotvec":
+            _set_policy_action_schema(dataset_features, BIMANUAL_EE_ROTVEC_NAMES)
         logging.info(
             "`record_ee_pose=true`: dataset low-dimensional state/action will be stored as Piper SDK "
             "end-effector feedback pose. Robot control still uses joint actions."
@@ -654,10 +702,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 policy_ds_meta = _metadata_with_features(dataset.meta, control_features)
                 policy_features = control_features
             else:
-                if cfg.policy_action_schema not in {"bimanual_ee_quat", "bimanual_ee_rpy"}:
+                if cfg.policy_action_schema not in {
+                    "bimanual_ee_quat",
+                    "bimanual_ee_rpy",
+                    "bimanual_ee_rotvec",
+                }:
                     raise ValueError(
                         "`record_ee_pose=true` policy execution only supports "
-                        "`policy_action_schema=bimanual_ee_quat` or `bimanual_ee_rpy`."
+                        "`policy_action_schema=bimanual_ee_quat`, `bimanual_ee_rpy`, "
+                        "or `bimanual_ee_rotvec`."
                     )
                 policy_action_names = ACTION_SCHEMA_NAMES[cfg.policy_action_schema]
                 if action_dim != len(policy_action_names):
@@ -666,9 +719,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         f"`policy_action_schema={cfg.policy_action_schema}`. Got action_dim={action_dim}, "
                         f"expected {len(policy_action_names)}."
                     )
-                policy_observation_names = (
-                    BIMANUAL_EE_RPY_NAMES if cfg.policy_action_schema == "bimanual_ee_rpy" else None
-                )
+                policy_observation_names = None
+                if cfg.policy_action_schema == "bimanual_ee_rpy":
+                    policy_observation_names = BIMANUAL_EE_RPY_NAMES
+                elif cfg.policy_action_schema == "bimanual_ee_rotvec":
+                    policy_observation_names = BIMANUAL_EE_ROTVEC_NAMES
                 policy_features = _policy_features_with_action_names(
                     dataset.meta.features,
                     policy_action_names,
@@ -677,6 +732,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 _set_policy_action_schema(policy_features, policy_action_names)
                 if cfg.policy_action_schema == "bimanual_ee_rpy":
                     policy_observation_transform = _bimanual_ee_rpy_policy_observation
+                elif cfg.policy_action_schema == "bimanual_ee_rotvec":
+                    policy_observation_transform = _bimanual_ee_rotvec_policy_observation
                 policy_ds_meta = _metadata_with_features(dataset.meta, policy_features)
                 policy_action_processor = _make_policy_action_processor_for_ee_schema(
                     cfg.policy_action_schema, policy_action_names, robot, cfg
@@ -776,6 +833,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     policy_observation_transform=policy_observation_transform,
                     ee_pose_storage=ee_pose_storage,
                     policy_stationary_arm_delta_threshold=cfg.policy_stationary_arm_delta_threshold,
+                    policy_tighten_closed_gripper=cfg.policy_tighten_closed_gripper,
+                    policy_gripper_tighten_enter_threshold=cfg.policy_gripper_tighten_enter_threshold,
+                    policy_gripper_tighten_release_threshold=cfg.policy_gripper_tighten_release_threshold,
+                    policy_gripper_tighten_value=cfg.policy_gripper_tighten_value,
+                    handoff_debug_enabled=cfg.handoff_debug_enabled,
+                    handoff_debug_log_frames=cfg.handoff_debug_log_frames,
                 )
 
                 episode_success = None
@@ -843,6 +906,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         policy_observation_transform=policy_observation_transform,
                         ee_pose_storage=ee_pose_storage,
                         policy_stationary_arm_delta_threshold=cfg.policy_stationary_arm_delta_threshold,
+                        handoff_debug_enabled=cfg.handoff_debug_enabled,
+                        handoff_debug_log_frames=cfg.handoff_debug_log_frames,
                     )
 
                     if callable(prepare_episode_start):

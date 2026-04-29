@@ -16,7 +16,7 @@
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
 import numpy as np
@@ -43,11 +43,16 @@ from lerobot.scripts.recording_hil import (
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
-from lerobot.scripts.ee_pose_action_utils import detect_bimanual_ee_schema, with_bimanual_ee_enabled_flags
+from lerobot.scripts.ee_pose_action_utils import (
+    detect_bimanual_ee_schema,
+    tighten_closed_policy_grippers,
+    with_bimanual_ee_enabled_flags,
+)
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.recording_annotations import resolve_collector_policy_id
+from lerobot.utils.piper_sdk import PIPER_JOINT_ACTION_KEYS
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device
 from lerobot.utils.visualization_utils import log_rerun_data
@@ -119,6 +124,141 @@ def _zero_values_for_feature(ds_features: dict[str, Any], feature_key: str) -> R
     return dict.fromkeys(feature.get("names", ()), 0.0)
 
 
+def _round_handoff_value(value: Any) -> Any:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if not np.isfinite(number):
+        return number
+    return round(number, 4)
+
+
+def _handoff_arm_prefixes(*actions: Mapping[str, Any] | None) -> tuple[str, ...]:
+    keys: set[str] = set()
+    for action in actions:
+        if isinstance(action, Mapping):
+            keys.update(str(key) for key in action)
+    if any(key.startswith("left_") or key.startswith("right_") for key in keys):
+        return ("left_", "right_")
+    return ("",)
+
+
+def _summarize_handoff_action(action: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(action, Mapping):
+        return None
+
+    summary: dict[str, Any] = {}
+    prefixes = _handoff_arm_prefixes(action)
+    for prefix in prefixes:
+        label = prefix.removesuffix("_") or "single"
+        arm: dict[str, Any] = {}
+
+        for key in ("enabled", "reset", "gripper.pos"):
+            full_key = f"{prefix}{key}"
+            if full_key in action:
+                arm[key] = _round_handoff_value(action[full_key])
+
+        absolute_key = f"{prefix}__absolute_joint_targets__"
+        if absolute_key in action:
+            arm["absolute_joint_targets"] = bool(action[absolute_key])
+
+        joint_values = [action.get(f"{prefix}{key}") for key in PIPER_JOINT_ACTION_KEYS]
+        if any(value is not None for value in joint_values):
+            arm["joints_deg"] = [_round_handoff_value(value) for value in joint_values]
+
+        target_keys = (
+            "ee.target_x",
+            "ee.target_y",
+            "ee.target_z",
+            "ee.target_rx",
+            "ee.target_ry",
+            "ee.target_rz",
+        )
+        target_values = [action.get(f"{prefix}{key}") for key in target_keys]
+        if all(value is not None for value in target_values):
+            arm["ee_target"] = [_round_handoff_value(value) for value in target_values]
+
+        quat_keys = ("ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw")
+        quat_values = [action.get(f"{prefix}{key}") for key in quat_keys]
+        if all(value is not None for value in quat_values):
+            arm["ee_quat"] = [_round_handoff_value(value) for value in quat_values]
+
+        rpy_keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+        rpy_values = [action.get(f"{prefix}{key}") for key in rpy_keys]
+        if all(value is not None for value in rpy_values):
+            arm["ee_rpy"] = [_round_handoff_value(value) for value in rpy_values]
+
+        delta_keys = (
+            "ee.delta_x",
+            "ee.delta_y",
+            "ee.delta_z",
+            "ee.delta_rx",
+            "ee.delta_ry",
+            "ee.delta_rz",
+        )
+        delta_values = [action.get(f"{prefix}{key}") for key in delta_keys]
+        if all(value is not None for value in delta_values):
+            arm["ee_delta"] = [_round_handoff_value(value) for value in delta_values]
+
+        if arm:
+            summary[label] = arm
+
+    if not summary:
+        summary["keys"] = sorted(str(key) for key in action)[:16]
+    return summary
+
+
+def _handoff_joint_delta_summary(
+    command: Mapping[str, Any] | None,
+    observation: Mapping[str, Any] | None,
+) -> dict[str, float]:
+    if not isinstance(command, Mapping) or not isinstance(observation, Mapping):
+        return {}
+
+    diffs: dict[str, float] = {}
+    for prefix in _handoff_arm_prefixes(command, observation):
+        deltas: list[float] = []
+        for key in PIPER_JOINT_ACTION_KEYS:
+            command_value = command.get(f"{prefix}{key}")
+            observation_value = observation.get(f"{prefix}{key}")
+            if command_value is None or observation_value is None:
+                continue
+            try:
+                deltas.append(abs(float(command_value) - float(observation_value)))
+            except (TypeError, ValueError):
+                continue
+        if deltas:
+            diffs[prefix.removesuffix("_") or "single"] = round(max(deltas), 4)
+    return diffs
+
+
+def _call_processor_handoff_hook(processor: Any, hook_name: str, *args: Any) -> tuple[bool, bool]:
+    called = False
+    updated = False
+    seen: set[int] = set()
+
+    def _visit(obj: Any) -> None:
+        nonlocal called, updated
+        if obj is None:
+            return
+        obj_id = id(obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        hook = getattr(obj, hook_name, None)
+        if callable(hook):
+            called = True
+            updated = bool(hook(*args)) or updated
+
+        for step in getattr(obj, "steps", ()) or ():
+            _visit(step)
+
+    _visit(processor)
+    return called, updated
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -157,6 +297,12 @@ def record_loop(
     policy_observation_transform: Callable[[RobotObservation], RobotObservation] | None = None,
     ee_pose_storage: Any | None = None,
     policy_stationary_arm_delta_threshold: float = 1e-5,
+    policy_tighten_closed_gripper: bool = False,
+    policy_gripper_tighten_enter_threshold: float = 40.0,
+    policy_gripper_tighten_release_threshold: float = 55.0,
+    policy_gripper_tighten_value: float = 0.0,
+    handoff_debug_enabled: bool = True,
+    handoff_debug_log_frames: int = 8,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -216,6 +362,9 @@ def record_loop(
     teleop_fallback_warned = False
     pending_teleop_pose_sync = False
     pending_policy_release_baseline = False
+    policy_gripper_tightened_keys: set[str] = set()
+    handoff_debug_frames_remaining = 0
+    handoff_debug_event_idx = 0
 
     teleop_arm_for_mode_switch: Any | None = None
     if isinstance(teleop, Teleoperator):
@@ -310,6 +459,9 @@ def record_loop(
 
         if events.get("toggle_intervention", False):
             events["toggle_intervention"] = False
+            if handoff_debug_enabled and handoff_debug_log_frames > 0:
+                handoff_debug_event_idx += 1
+                handoff_debug_frames_remaining = int(handoff_debug_log_frames)
             if intervention_enabled:
                 if intervention_state == INTERVENTION_STATE_POLICY:
                     intervention_state = INTERVENTION_STATE_ACTIVE
@@ -351,6 +503,14 @@ def record_loop(
                         logging.warning("Teleop VR anchor sync was requested but no arm pose was updated.")
                 except Exception:
                     logging.exception("Failed to sync teleop VR anchor from current robot observation.")
+            try:
+                called, synced = _call_processor_handoff_hook(teleop_action_processor, "sync_from_observation", obs)
+                if called and synced:
+                    logging.info("Teleop IK state synced from current robot observation.")
+                elif called:
+                    logging.warning("Teleop IK state sync was requested but no arm state was updated.")
+            except Exception:
+                logging.exception("Failed to sync teleop IK state from current robot observation.")
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
@@ -375,7 +535,9 @@ def record_loop(
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
+        raw_teleop_action: RobotAction | None = None
         raw_policy_action_for_storage: RobotAction | None = None
+        policy_action_for_execution: RobotAction | None = None
         if (
             policy is not None
             and preprocessor is not None
@@ -396,7 +558,28 @@ def record_loop(
                 uncond_runtime_state=uncond_policy_runtime_state,
             )
             raw_policy_action_for_storage = make_robot_action(policy_action, features_for_policy)
+            if policy_tighten_closed_gripper:
+                raw_policy_action_for_storage = tighten_closed_policy_grippers(
+                    raw_policy_action_for_storage,
+                    policy_gripper_tightened_keys,
+                    enter_threshold=policy_gripper_tighten_enter_threshold,
+                    release_threshold=policy_gripper_tighten_release_threshold,
+                    tighten_value=policy_gripper_tighten_value,
+                )
             if pending_policy_release_baseline and detect_bimanual_ee_schema(raw_policy_action_for_storage):
+                try:
+                    called, anchored = _call_processor_handoff_hook(
+                        policy_action_processor,
+                        "anchor_absolute_target_from_observation",
+                        raw_policy_action_for_storage,
+                        obs,
+                    )
+                    if called and anchored:
+                        logging.info("Policy IK absolute EE anchor synced from current robot observation.")
+                    elif called:
+                        logging.warning("Policy IK absolute EE anchor sync was requested but no arm state was updated.")
+                except Exception:
+                    logging.exception("Failed to sync policy IK absolute EE anchor from current robot observation.")
                 policy_action_for_execution = {
                     **raw_policy_action_for_storage,
                     "left_enabled": False,
@@ -420,6 +603,7 @@ def record_loop(
 
         if isinstance(teleop, Teleoperator):
             act = run_with_connection_retry("teleop.get_action", teleop.get_action)
+            raw_teleop_action = act
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
@@ -430,6 +614,7 @@ def record_loop(
             keyboard_action = teleop_keyboard.get_action()
             base_action = robot._from_keyboard_to_base_action(keyboard_action)
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+            raw_teleop_action = act
             act_processed_teleop = teleop_action_processor((act, obs))
 
         if act_processed_policy is None and act_processed_teleop is None:
@@ -495,6 +680,28 @@ def record_loop(
                 "robot.send_action",
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
+
+        if handoff_debug_enabled and handoff_debug_frames_remaining > 0:
+            selected_source = "policy" if selected_from_policy else "teleop"
+            logging.info(
+                "[HIL_HANDOFF] event=%d remaining=%d state=%.1f source=%s "
+                "obs=%s policy_raw=%s policy_exec=%s policy_ik=%s "
+                "teleop_raw=%s teleop_ik=%s final=%s sent=%s max_joint_delta_deg=%s",
+                handoff_debug_event_idx,
+                handoff_debug_frames_remaining,
+                intervention_state,
+                selected_source,
+                _summarize_handoff_action(obs),
+                _summarize_handoff_action(raw_policy_action_for_storage),
+                _summarize_handoff_action(policy_action_for_execution),
+                _summarize_handoff_action(act_processed_policy),
+                _summarize_handoff_action(raw_teleop_action),
+                _summarize_handoff_action(act_processed_teleop),
+                _summarize_handoff_action(robot_action_to_send),
+                _summarize_handoff_action(_sent_action),
+                _handoff_joint_delta_summary(robot_action_to_send, obs),
+            )
+            handoff_debug_frames_remaining -= 1
 
         ee_action_after_action = (
             run_with_connection_retry("ee_pose_storage.read_action", ee_pose_storage.read)

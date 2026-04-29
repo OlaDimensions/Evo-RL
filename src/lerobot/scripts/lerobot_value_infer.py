@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import logging
 import math
 from pathlib import Path
@@ -26,7 +28,7 @@ import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, Sampler, Subset
 from tqdm.auto import tqdm
 
 from lerobot.configs import parser
@@ -52,6 +54,8 @@ from lerobot.values.pistar06.modeling_pistar06 import (
     EpisodeTargetInfo,
     compute_normalized_value_targets,
 )
+
+VALUE_INFER_PROGRESS_SCHEMA_VERSION = 1
 
 
 class ContiguousDistributedEvalSampler(Sampler[int]):
@@ -90,6 +94,94 @@ class ContiguousDistributedEvalSampler(Sampler[int]):
 def _set_infer_logger_levels() -> None:
     for logger_name in ["fsspec", "fsspec.local", "huggingface_hub", "datasets", "torchcodec"]:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+def _get_resume_progress_path(cfg: ValueInferencePipelineConfig, output_dir: Path) -> Path:
+    if cfg.resume.progress_file is not None:
+        return Path(cfg.resume.progress_file)
+    return output_dir / "value_infer_progress.npz"
+
+
+def _absolute_indices_checksum(absolute_indices: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(absolute_indices.astype(np.int64, copy=False))
+    return hashlib.sha256(contiguous.tobytes()).hexdigest()
+
+
+def _build_resume_metadata(
+    cfg: ValueInferencePipelineConfig,
+    pretrained_dir: Path,
+    absolute_indices: np.ndarray,
+    frame_count: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": VALUE_INFER_PROGRESS_SCHEMA_VERSION,
+        "dataset": {
+            "repo_id": cfg.dataset.repo_id,
+            "root": cfg.dataset.root,
+            "episodes": cfg.dataset.episodes,
+            "revision": cfg.dataset.revision,
+        },
+        "checkpoint": str(pretrained_dir),
+        "value_field": cfg.acp.value_field,
+        "frame_count": int(frame_count),
+        "absolute_indices_checksum": _absolute_indices_checksum(absolute_indices),
+    }
+
+
+def _save_prediction_progress_atomic(
+    progress_path: Path,
+    prediction_lookup: np.ndarray,
+    prediction_seen: np.ndarray,
+    absolute_indices: np.ndarray,
+    metadata: dict[str, Any],
+) -> int:
+    seen_indices = absolute_indices[prediction_seen[absolute_indices]]
+    seen_values = prediction_lookup[seen_indices].astype(np.float32, copy=False)
+
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = progress_path.with_name(f"{progress_path.name}.tmp")
+    with open(tmp_path, "wb") as f:
+        np.savez_compressed(
+            f,
+            indices=seen_indices.astype(np.int64, copy=False),
+            values=seen_values,
+            metadata_json=np.array(json.dumps(metadata, sort_keys=True)),
+        )
+    tmp_path.replace(progress_path)
+    return int(seen_indices.shape[0])
+
+
+def _load_prediction_progress(
+    progress_path: Path,
+    expected_metadata: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not progress_path.is_file():
+        return None
+
+    with np.load(progress_path, allow_pickle=False) as data:
+        required_keys = {"indices", "values", "metadata_json"}
+        missing_keys = required_keys.difference(data.files)
+        if missing_keys:
+            raise ValueError(f"Resume progress file {progress_path} is missing keys: {sorted(missing_keys)}")
+
+        metadata = json.loads(str(data["metadata_json"].item()))
+        if metadata != expected_metadata:
+            raise ValueError(
+                f"Resume progress file {progress_path} does not match this inference run. "
+                "Use resume.reset=true to ignore the old progress file and start a fresh cache."
+            )
+
+        indices = np.asarray(data["indices"], dtype=np.int64)
+        values = np.asarray(data["values"], dtype=np.float32)
+
+    if indices.ndim != 1 or values.ndim != 1:
+        raise ValueError(f"Resume progress file {progress_path} must contain rank-1 indices and values.")
+    if indices.shape[0] != values.shape[0]:
+        raise ValueError(
+            f"Resume progress file {progress_path} has {indices.shape[0]} indices but {values.shape[0]} values."
+        )
+
+    return indices, values
 
 
 def _create_accelerator(cfg: ValueInferencePipelineConfig, accelerator: Accelerator | None) -> Accelerator:
@@ -527,8 +619,51 @@ def run_value_inference_pipeline(
     else:
         interventions = np.zeros(frame_count, dtype=np.float32)
 
+    max_abs_index = int(np.max(absolute_indices))
+    prediction_lookup = np.zeros(max_abs_index + 1, dtype=np.float32)
+    prediction_seen = np.zeros(max_abs_index + 1, dtype=np.bool_)
+
+    progress_path = _get_resume_progress_path(cfg=cfg, output_dir=output_dir)
+    progress_metadata = _build_resume_metadata(
+        cfg=cfg,
+        pretrained_dir=pretrained_dir,
+        absolute_indices=absolute_indices,
+        frame_count=frame_count,
+    )
+
+    if cfg.resume.reset and accelerator.is_main_process and progress_path.exists():
+        progress_path.unlink()
+        logging.info("Removed existing value inference progress file: %s", progress_path)
+    accelerator.wait_for_everyone()
+
+    if cfg.resume.enable:
+        loaded_progress = _load_prediction_progress(
+            progress_path=progress_path,
+            expected_metadata=progress_metadata,
+        )
+        if loaded_progress is not None:
+            progress_indices, progress_values = loaded_progress
+            known_mask = np.isin(progress_indices, absolute_indices)
+            if not bool(np.all(known_mask)):
+                unknown_count = int(np.sum(~known_mask))
+                raise ValueError(
+                    f"Resume progress file {progress_path} contains {unknown_count} indices "
+                    "that are not present in the current dataset."
+                )
+            prediction_lookup[progress_indices] = progress_values
+            prediction_seen[progress_indices] = True
+            if accelerator.is_main_process:
+                logging.info(
+                    "Loaded value inference progress | path=%s restored_frames=%d",
+                    progress_path,
+                    int(progress_indices.shape[0]),
+                )
+
+    missing_positions = np.flatnonzero(~prediction_seen[absolute_indices]).astype(np.int64, copy=False)
+    eval_dataset = Subset(dataset, missing_positions.tolist())
+
     eval_loader = DataLoader(
-        dataset,
+        eval_dataset,
         batch_size=cfg.runtime.batch_size,
         shuffle=False,
         num_workers=cfg.runtime.num_workers,
@@ -540,19 +675,16 @@ def run_value_inference_pipeline(
     eval_loader = accelerator.prepare(eval_loader)
 
     if accelerator.is_main_process:
-        max_abs_index = int(np.max(absolute_indices))
-        prediction_lookup = np.zeros(max_abs_index + 1, dtype=np.float32)
-        prediction_seen = np.zeros(max_abs_index + 1, dtype=np.bool_)
         logging.info(
-            "Start value inference | world_size=%d batches=%d batch_size=%d checkpoint=%s",
+            "Start value inference | world_size=%d batches=%d batch_size=%d checkpoint=%s pending_frames=%d",
             accelerator.num_processes,
             len(eval_loader),
             cfg.runtime.batch_size,
             pretrained_dir,
+            int(missing_positions.shape[0]),
         )
     else:
-        prediction_lookup = None
-        prediction_seen = None
+        progress_path = None
 
     value_policy.eval()
     eval_iter = tqdm(
@@ -564,7 +696,7 @@ def run_value_inference_pipeline(
     )
 
     with torch.no_grad():
-        for raw_batch in eval_iter:
+        for batch_idx, raw_batch in enumerate(eval_iter, start=1):
             batch_indices = raw_batch["index"]
             if not isinstance(batch_indices, torch.Tensor):
                 batch_indices = torch.as_tensor(batch_indices)
@@ -582,13 +714,29 @@ def run_value_inference_pipeline(
                 val_np = gathered_val.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
                 prediction_lookup[idx_np] = val_np
                 prediction_seen[idx_np] = True
+                if cfg.resume.enable and batch_idx % cfg.resume.save_every_batches == 0:
+                    saved_count = _save_prediction_progress_atomic(
+                        progress_path=progress_path,
+                        prediction_lookup=prediction_lookup,
+                        prediction_seen=prediction_seen,
+                        absolute_indices=absolute_indices,
+                        metadata=progress_metadata,
+                    )
+                    logging.info("Saved value inference progress | path=%s frames=%d", progress_path, saved_count)
+
+    if cfg.resume.enable and accelerator.is_main_process:
+        saved_count = _save_prediction_progress_atomic(
+            progress_path=progress_path,
+            prediction_lookup=prediction_lookup,
+            prediction_seen=prediction_seen,
+            absolute_indices=absolute_indices,
+            metadata=progress_metadata,
+        )
+        logging.info("Saved value inference progress | path=%s frames=%d", progress_path, saved_count)
 
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        if prediction_lookup is None or prediction_seen is None:
-            raise RuntimeError("Prediction buffers unexpectedly missing on main process.")
-
         missing_mask = ~prediction_seen[absolute_indices]
         if bool(np.any(missing_mask)):
             missing_count = int(np.sum(missing_mask))

@@ -118,6 +118,83 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             )
         self._clear_backend_previous_q()
 
+    def sync_from_observation(self, observation: dict[str, Any]) -> bool:
+        """Use measured joints as the next IK command baseline."""
+        if self.ik_backend is None:
+            raise RuntimeError("EEToJointIKProcessorStep requires an ik_backend instance.")
+        q_obs, source = self._observation_q_rad_from_dict(observation)
+        if q_obs is None:
+            logger.warning("[IK] cannot sync IK state from observation; missing/invalid %s joints", self.output_prefix or "arm")
+            return False
+
+        try:
+            target_T = self.ik_backend.fk(q_obs)
+        except Exception as exc:
+            logger.warning("[IK] cannot sync IK target from observation FK: %s", exc)
+            target_T = self.arm_init_T.copy()
+
+        with self._lock:
+            self._state.solve_generation += 1
+            self._state.async_action_ready = None
+            self._state.ik_inflight = False
+            self._state.last_q = q_obs.copy()
+            self._state.last_command_q = q_obs.copy()
+            self._state.target_T = np.asarray(target_T, dtype=np.float64).copy()
+            self._state.armed = True
+            self._state.reset_plan = []
+            self._state.reset_active = False
+            self._state.reset_goal_q = None
+            self._state.absolute_input_anchor_T = None
+            self._state.absolute_output_anchor_T = None
+        self._set_backend_previous_q(q_obs)
+        logger.info(
+            "[IK_DIAG] synced IK state from %s prefix=%s q_deg=%s",
+            source,
+            self.output_prefix or "single",
+            np.array2string(np.rad2deg(q_obs[: len(PIPER_JOINT_ACTION_KEYS)]), precision=3, suppress_small=True),
+        )
+        return True
+
+    def anchor_absolute_target_from_observation(self, action: RobotAction, observation: dict[str, Any]) -> bool:
+        """Map future absolute EE targets relative to the current measured pose."""
+        if self.ik_backend is None:
+            raise RuntimeError("EEToJointIKProcessorStep requires an ik_backend instance.")
+        abs_target_T = self._action_to_absolute_target(action)
+        if abs_target_T is None:
+            return False
+        q_obs, source = self._observation_q_rad_from_dict(observation)
+        if q_obs is None:
+            logger.warning("[IK] cannot anchor absolute target; missing/invalid %s joints", self.output_prefix or "arm")
+            return False
+        try:
+            output_anchor_T = self.ik_backend.fk(q_obs)
+        except Exception as exc:
+            logger.warning("[IK] cannot anchor absolute target because FK failed: %s", exc)
+            return False
+
+        with self._lock:
+            self._state.solve_generation += 1
+            self._state.async_action_ready = None
+            self._state.ik_inflight = False
+            self._state.last_q = q_obs.copy()
+            self._state.last_command_q = q_obs.copy()
+            self._state.target_T = np.asarray(output_anchor_T, dtype=np.float64).copy()
+            self._state.armed = True
+            self._state.reset_plan = []
+            self._state.reset_active = False
+            self._state.reset_goal_q = None
+            self._state.absolute_input_anchor_T = abs_target_T.copy()
+            self._state.absolute_output_anchor_T = np.asarray(output_anchor_T, dtype=np.float64).copy()
+        self._set_backend_previous_q(q_obs)
+        logger.info(
+            "[IK_DIAG] anchored absolute EE target from %s prefix=%s input_xyz=%s output_xyz=%s",
+            source,
+            self.output_prefix or "single",
+            np.array2string(abs_target_T[:3, 3], precision=4, suppress_small=True),
+            np.array2string(output_anchor_T[:3, 3], precision=4, suppress_small=True),
+        )
+        return True
+
     def action(self, action: RobotAction) -> RobotAction:
         if self.ik_backend is None:
             raise RuntimeError("EEToJointIKProcessorStep requires an ik_backend instance.")
@@ -412,7 +489,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             alpha = 1.0 / float(segment_count)
             segment_T = self._interpolate_pose(start_T, target_T, alpha)
             result = self.ik_backend.solve(segment_T, q_seed=q_seed)
-            logger.info(
+            logger.debug(
                 "[IK_DIAG] segmented_retry segments=%d alpha=%.3f success=%s reason=%s",
                 segment_count,
                 alpha,
@@ -432,7 +509,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
     def _solve_target_with_adaptive_alphas(self, target_T: np.ndarray, q_seed: np.ndarray) -> TargetSolveResult:
         alphas = self._normalized_branch_target_alphas()
         result = self.ik_backend.solve(target_T, q_seed=q_seed)
-        logger.info(
+        logger.debug(
             "[IK_DIAG] branch_target alpha=1.000 success=%s reason=%s",
             result.success,
             result.reason,
@@ -455,7 +532,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             candidate_T = self._interpolate_pose(start_T, target_T, alpha)
             result = self.ik_backend.solve(candidate_T, q_seed=q_seed)
             last_result = result
-            logger.info(
+            logger.debug(
                 "[IK_DIAG] branch_target alpha=%.3f success=%s reason=%s",
                 alpha,
                 result.success,
@@ -485,14 +562,14 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         if not self.commit_accepted_target_only:
             return
         if solve_result.accepted_target_T is None:
-            logger.info(
+            logger.debug(
                 "[IK_DIAG] committed_target=unchanged source=%s reason=%s",
                 solve_result.target_source,
                 solve_result.result.reason,
             )
             return
         self._state.target_T = solve_result.accepted_target_T.copy()
-        logger.info(
+        logger.debug(
             "[IK_DIAG] committed_target=%s alpha=%.3f",
             solve_result.target_source,
             solve_result.alpha,
@@ -532,6 +609,9 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION, {})
         if not isinstance(observation, dict):
             return None, "none"
+        return self._observation_q_rad_from_dict(observation)
+
+    def _observation_q_rad_from_dict(self, observation: dict[str, Any]) -> tuple[np.ndarray | None, str]:
         vals: list[float] = []
         for key in PIPER_JOINT_ACTION_KEYS:
             obs_key = f"{self.output_prefix}{key}"
@@ -641,7 +721,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         else:
             max_step_rad = 0.0
             limit_baseline_name = "none"
-        logger.info(
+        logger.debug(
             "[IK_TRACE] solve_ms=%.2f collision_free=%s seed=%s raw_q_deg=%s command_q_deg=%s "
             "joint_smooth_alpha=%.3f max_joint_step_deg=%.3f limit_baseline=%s gripper=%.3f",
             result.solve_ms,
@@ -714,7 +794,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         if now - self._state.last_target_log_t < 0.5:
             return
         self._state.last_target_log_t = now
-        logger.info(
+        logger.debug(
             "[IK_TRACE] absolute_target=%s gripper=%.3f seed=%s q_seed=%s target_T=%s",
             absolute_target,
             gripper,
@@ -729,7 +809,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             seed_source != self._state.last_seed_source
             or now - self._state.last_seed_log_t >= 2.0
         ):
-            logger.info("[IK] seed_source=%s", seed_source)
+            logger.debug("[IK] seed_source=%s", seed_source)
             self._state.last_seed_source = seed_source
             self._state.last_seed_log_t = now
 
@@ -738,7 +818,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
         if self.diagnostics_interval_s > 0 and now - self._state.last_idle_log_t < self.diagnostics_interval_s:
             return
         self._state.last_idle_log_t = now
-        logger.info(
+        logger.debug(
             "[IK_DIAG] idle reason=%s generation=%d inflight=%s ready=%s gripper=%.3f",
             reason,
             self._state.solve_generation,
@@ -764,7 +844,7 @@ class EEToJointIKProcessorStep(RobotActionProcessorStep):
             return
         self._state.last_async_log_t = now
         self._state.last_async_event = event
-        logger.info(
+        logger.debug(
             "[IK_DIAG] async event=%s generation=%d active_generation=%s inflight=%s ready=%s seed=%s",
             event,
             generation,
@@ -888,6 +968,16 @@ class DualArmEEToJointIKProcessorStep(RobotActionProcessorStep):
     def reset(self) -> None:
         self.left_step.reset()
         self.right_step.reset()
+
+    def sync_from_observation(self, observation: dict[str, Any]) -> bool:
+        left_synced = self.left_step.sync_from_observation(observation)
+        right_synced = self.right_step.sync_from_observation(observation)
+        return left_synced or right_synced
+
+    def anchor_absolute_target_from_observation(self, action: RobotAction, observation: dict[str, Any]) -> bool:
+        left_anchored = self.left_step.anchor_absolute_target_from_observation(action, observation)
+        right_anchored = self.right_step.anchor_absolute_target_from_observation(action, observation)
+        return left_anchored or right_anchored
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

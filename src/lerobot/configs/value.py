@@ -60,6 +60,18 @@ class ValueInferenceRuntimeConfig:
 
 
 @dataclass
+class ValueInferenceResumeConfig:
+    enable: bool = True
+    save_every_batches: int = 10
+    progress_file: Path | None = None
+    reset: bool = False
+
+    def validate(self) -> None:
+        if self.save_every_batches <= 0:
+            raise ValueError("'resume.save_every_batches' must be > 0.")
+
+
+@dataclass
 class ValueInferenceACPConfig:
     enable: bool = False
     n_step: int = 50
@@ -117,6 +129,7 @@ class ValueInferencePipelineConfig:
         default_factory=lambda: ValueInferenceCheckpointConfig(checkpoint_path="")
     )
     runtime: ValueInferenceRuntimeConfig = field(default_factory=ValueInferenceRuntimeConfig)
+    resume: ValueInferenceResumeConfig = field(default_factory=ValueInferenceResumeConfig)
     acp: ValueInferenceACPConfig = field(default_factory=ValueInferenceACPConfig)
     viz: ValueInferenceVizConfig = field(default_factory=ValueInferenceVizConfig)
 
@@ -130,6 +143,7 @@ class ValueInferencePipelineConfig:
         self.dataset.validate()
         self.inference.validate()
         self.runtime.validate()
+        self.resume.validate()
         self.acp.validate()
         self.viz.validate()
 

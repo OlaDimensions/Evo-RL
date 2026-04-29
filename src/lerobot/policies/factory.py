@@ -31,7 +31,9 @@ from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.gr00t_remote.configuration_gr00t_remote import Gr00TRemoteConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.openpi_remote.configuration_openpi_remote import OpenPIRemoteConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -103,6 +105,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "openpi_remote":
+        from lerobot.policies.openpi_remote.modeling_openpi_remote import OpenPIRemotePolicy
+
+        return OpenPIRemotePolicy
+    elif name == "gr00t_remote":
+        from lerobot.policies.gr00t_remote.modeling_gr00t_remote import Gr00TRemotePolicy
+
+        return Gr00TRemotePolicy
     elif name == "sac":
         from lerobot.policies.sac.modeling_sac import SACPolicy
 
@@ -169,6 +179,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "openpi_remote":
+        return OpenPIRemoteConfig(**kwargs)
+    elif policy_type == "gr00t_remote":
+        return Gr00TRemoteConfig(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
@@ -329,6 +343,25 @@ def make_pre_post_processors(
         from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 
         processors = make_pi05_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+    elif isinstance(policy_cfg, OpenPIRemoteConfig):
+        from lerobot.policies.openpi_remote.processor_openpi_remote import (
+            make_openpi_remote_pre_post_processors,
+        )
+
+        processors = make_openpi_remote_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, Gr00TRemoteConfig):
+        from lerobot.policies.gr00t_remote.processor_gr00t_remote import (
+            make_gr00t_remote_pre_post_processors,
+        )
+
+        processors = make_gr00t_remote_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

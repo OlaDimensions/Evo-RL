@@ -363,7 +363,7 @@ class PiperFollower(Robot):
                 )
                 self._last_gripper_target = float(gripper_target)
                 sent_action["gripper.pos"] = milli_to_unit(gripper_pos_raw)
-                logger.info(
+                logger.debug(
                     "[PIPER_TRACE] gripper target=%.3f raw=%d passthrough=%s",
                     float(gripper_target),
                     gripper_pos_raw,
@@ -382,7 +382,7 @@ class PiperFollower(Robot):
         if now - self._last_command_log_t < 0.5:
             return
         self._last_command_log_t = now
-        logger.info(
+        logger.debug(
             "[PIPER_TRACE] absolute=%s joint_targets_deg=%s joint_commands_milli=%s",
             absolute_joint_targets,
             [round(float(v), 3) for v in joint_targets],

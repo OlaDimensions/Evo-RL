@@ -14,7 +14,9 @@
 
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+from .gr00t_remote.configuration_gr00t_remote import Gr00TRemoteConfig as Gr00TRemoteConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
+from .openpi_remote.configuration_openpi_remote import OpenPIRemoteConfig as OpenPIRemoteConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
@@ -31,6 +33,8 @@ __all__ = [
     "PI0Config",
     "PI05Config",
     "PI0FastConfig",
+    "OpenPIRemoteConfig",
+    "Gr00TRemoteConfig",
     "SmolVLAConfig",
     "SARMConfig",
     "TDMPCConfig",

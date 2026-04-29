@@ -251,7 +251,7 @@ class PiperPinocchioIKBackend(IKBackend):
                         pose_error_exceeded,
                         pose_error_check_reason,
                     )
-                logger.info(
+                logger.debug(
                     "[IK] solve_ms=%.2f collision_ms=%.2f total_ms=%.2f iter=%s status=%s "
                     "collision_free=%s rejected=%s pose_error_mode=%s pos_error_m=%.4f "
                     "ori_error_deg=%.2f pose_error_exceeded=%s",
@@ -335,7 +335,7 @@ class PiperPinocchioIKBackend(IKBackend):
         if interval_s > 0 and now - self._last_pose_error_log_t < interval_s:
             return
         self._last_pose_error_log_t = now
-        logger.info(
+        logger.debug(
             "[IK_DIAG] pose_error mode=%s pos_error_m=%.4f ori_error_deg=%.2f exceeded=%s "
             "max_pos_m=%.4f max_ori_deg=%.2f",
             self.config.pose_error_mode,
@@ -368,25 +368,44 @@ class PiperPinocchioIKBackend(IKBackend):
             if q is None:
                 self._q_prev = np.zeros(0, dtype=np.float64)
                 return
-            q_arr = np.asarray(q, dtype=np.float64)[: self.reduced_robot.model.nq]
-            if self._is_valid_q(q_arr):
-                self._q_prev = q_arr.copy()
-            else:
+            q_arr = self._coerce_q(q)
+            if q_arr is None:
                 logger.warning("[IK] ignoring invalid previous_q update")
                 self._q_prev = np.zeros(0, dtype=np.float64)
+            else:
+                self._q_prev = self.clip(q_arr)
 
     def clear_previous_q(self) -> None:
         self.set_previous_q(None)
 
     def _warm_start(self, q_seed: np.ndarray | None) -> np.ndarray:
         if q_seed is not None:
-            q = np.asarray(q_seed, dtype=np.float64)[: self.reduced_robot.model.nq]
-            if self._is_valid_q(q):
-                return q
-            logger.warning("[IK] invalid q_seed; falling back to previous/home seed")
+            q = self._coerce_q(q_seed)
+            if q is not None:
+                q_clipped = self.clip(q)
+                if not np.allclose(q, q_clipped, atol=1e-9, rtol=0.0):
+                    logger.warning("[IK] q_seed outside limits; clipping warm start instead of falling back")
+                return q_clipped
+            logger.warning("[IK] invalid q_seed shape/value; falling back to previous/home seed")
         if self._is_valid_q(self._q_prev):
             return self._q_prev.copy()
         return self.home_q()
+
+    def clip(self, q: np.ndarray) -> np.ndarray:
+        q_arr = np.asarray(q, dtype=np.float64)[: self.reduced_robot.model.nq]
+        lower = np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64)
+        upper = np.asarray(self.reduced_robot.model.upperPositionLimit, dtype=np.float64)
+        return np.clip(q_arr, lower, upper)
+
+    def _coerce_q(self, q: np.ndarray) -> np.ndarray | None:
+        q_arr = np.asarray(q, dtype=np.float64)
+        nq = self.reduced_robot.model.nq
+        if q_arr.size < nq:
+            return None
+        q_arr = q_arr.reshape(-1)[:nq]
+        if q_arr.shape != (nq,) or not np.isfinite(q_arr).all():
+            return None
+        return q_arr
 
     def _q_bounds_for_warm_start(self, warm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         lower = np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64).copy()

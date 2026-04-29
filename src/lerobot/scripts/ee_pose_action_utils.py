@@ -9,6 +9,7 @@ import math
 import numpy as np
 
 from lerobot.processor import RobotAction, RobotActionProcessorStep
+from lerobot.utils.rotation import Rotation
 
 SDK_EE_OFFSET_XYZRPY = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
@@ -66,6 +67,33 @@ BIMANUAL_EE_RXRYRZ_NAMES = (
     "right_gripper.pos",
 )
 
+SINGLE_EE_ROTVEC_NAMES = (
+    "ee.x",
+    "ee.y",
+    "ee.z",
+    "ee.rotvec_x",
+    "ee.rotvec_y",
+    "ee.rotvec_z",
+    "gripper.pos",
+)
+
+BIMANUAL_EE_ROTVEC_NAMES = (
+    "left_ee.x",
+    "left_ee.y",
+    "left_ee.z",
+    "left_ee.rotvec_x",
+    "left_ee.rotvec_y",
+    "left_ee.rotvec_z",
+    "left_gripper.pos",
+    "right_ee.x",
+    "right_ee.y",
+    "right_ee.z",
+    "right_ee.rotvec_x",
+    "right_ee.rotvec_y",
+    "right_ee.rotvec_z",
+    "right_gripper.pos",
+)
+
 SINGLE_EE_QUAT_NAMES = (
     "ee.x",
     "ee.y",
@@ -99,14 +127,18 @@ BIMANUAL_EE_QUAT_NAMES = (
 BIMANUAL_EE_SCHEMAS = (
     BIMANUAL_EE_RPY_NAMES,
     BIMANUAL_EE_RXRYRZ_NAMES,
+    BIMANUAL_EE_ROTVEC_NAMES,
     BIMANUAL_EE_QUAT_NAMES,
 )
+POLICY_GRIPPER_ACTION_KEYS = ("gripper.pos", "left_gripper.pos", "right_gripper.pos")
 
 ACTION_SCHEMA_NAMES = {
     "single_ee_rpy": SINGLE_EE_RPY_NAMES,
     "bimanual_ee_rpy": BIMANUAL_EE_RPY_NAMES,
     "single_ee_rxryrz": SINGLE_EE_RXRYRZ_NAMES,
     "bimanual_ee_rxryrz": BIMANUAL_EE_RXRYRZ_NAMES,
+    "single_ee_rotvec": SINGLE_EE_ROTVEC_NAMES,
+    "bimanual_ee_rotvec": BIMANUAL_EE_ROTVEC_NAMES,
     "single_ee_quat": SINGLE_EE_QUAT_NAMES,
     "bimanual_ee_quat": BIMANUAL_EE_QUAT_NAMES,
 }
@@ -129,6 +161,14 @@ def bimanual_ee_quat_to_rpy_values(values: RobotAction) -> RobotAction:
     return {
         **_quat_arm_to_rpy_values(values, prefix="left_"),
         **_quat_arm_to_rpy_values(values, prefix="right_"),
+    }
+
+
+def bimanual_ee_quat_to_rotvec_values(values: RobotAction) -> RobotAction:
+    """Return bimanual EE XYZ+rotvec values from bimanual EE quaternion values."""
+    return {
+        **_quat_arm_to_rotvec_values(values, prefix="left_"),
+        **_quat_arm_to_rotvec_values(values, prefix="right_"),
     }
 
 
@@ -173,6 +213,34 @@ def with_bimanual_ee_enabled_flags(
         action, previous_action, schema_names, stationary_arm_delta_threshold
     )
     return {**action, "left_enabled": left_enabled, "right_enabled": right_enabled}
+
+
+def tighten_closed_policy_grippers(
+    action: RobotAction,
+    tightened_keys: set[str],
+    *,
+    enter_threshold: float,
+    release_threshold: float,
+    tighten_value: float,
+) -> RobotAction:
+    """Return a copy with closed policy grippers tightened using hysteresis."""
+    tightened_action = dict(action)
+    for key in POLICY_GRIPPER_ACTION_KEYS:
+        if key not in action:
+            continue
+        value = float(action[key])
+        if key in tightened_keys:
+            if value >= release_threshold:
+                tightened_keys.remove(key)
+                tightened_action[key] = value
+            else:
+                tightened_action[key] = float(tighten_value)
+        elif value < enter_threshold:
+            tightened_keys.add(key)
+            tightened_action[key] = float(tighten_value)
+        else:
+            tightened_action[key] = value
+    return tightened_action
 
 
 def _max_abs_delta(action: RobotAction, previous_action: RobotAction, names: tuple[str, ...]) -> float:
@@ -246,6 +314,41 @@ class MapPolicyRXRYRZActionToRPYStep(RobotActionProcessorStep):
         return features
 
 
+class MapPolicyRotVecActionToRPYStep(RobotActionProcessorStep):
+    """Convert rotation-vector policy fields to RPY fields."""
+
+    def __init__(self, *, bimanual: bool = False):
+        self.bimanual = bimanual
+
+    def action(self, action: RobotAction) -> RobotAction:
+        if self.bimanual:
+            return {
+                **self._map_arm(action, prefix="left_"),
+                **self._map_arm(action, prefix="right_"),
+            }
+        return self._map_arm(action, prefix="")
+
+    @staticmethod
+    def _map_arm(action: RobotAction, *, prefix: str) -> RobotAction:
+        roll, pitch, yaw = _rotvec_to_rpy(
+            float(action[f"{prefix}ee.rotvec_x"]),
+            float(action[f"{prefix}ee.rotvec_y"]),
+            float(action[f"{prefix}ee.rotvec_z"]),
+        )
+        return {
+            f"{prefix}ee.x": float(action[f"{prefix}ee.x"]),
+            f"{prefix}ee.y": float(action[f"{prefix}ee.y"]),
+            f"{prefix}ee.z": float(action[f"{prefix}ee.z"]),
+            f"{prefix}ee.roll": roll,
+            f"{prefix}ee.pitch": pitch,
+            f"{prefix}ee.yaw": yaw,
+            f"{prefix}gripper.pos": float(action[f"{prefix}gripper.pos"]),
+        }
+
+    def transform_features(self, features):
+        return features
+
+
 class MapPolicyQuatActionToRPYStep(RobotActionProcessorStep):
     """Convert quaternion policy fields to RPY fields."""
 
@@ -286,6 +389,14 @@ def _rxryrz_to_rpy(rx: float, ry: float, rz: float) -> tuple[float, float, float
     return roll, pitch, yaw
 
 
+def _rotvec_to_rpy(rx: float, ry: float, rz: float) -> tuple[float, float, float]:
+    matrix = Rotation.from_rotvec(np.asarray([rx, ry, rz], dtype=np.float64)).as_matrix()
+    roll = math.atan2(matrix[2, 1], matrix[2, 2])
+    pitch = math.asin(float(np.clip(-matrix[2, 0], -1.0, 1.0)))
+    yaw = math.atan2(matrix[1, 0], matrix[0, 0])
+    return roll, pitch, yaw
+
+
 def _quat_arm_to_rpy_values(action: RobotAction, *, prefix: str) -> RobotAction:
     roll, pitch, yaw = _quat_xyzw_to_rpy(
         float(action[f"{prefix}ee.qx"]),
@@ -300,6 +411,29 @@ def _quat_arm_to_rpy_values(action: RobotAction, *, prefix: str) -> RobotAction:
         f"{prefix}ee.roll": roll,
         f"{prefix}ee.pitch": pitch,
         f"{prefix}ee.yaw": yaw,
+        f"{prefix}gripper.pos": float(action[f"{prefix}gripper.pos"]),
+    }
+
+
+def _quat_arm_to_rotvec_values(action: RobotAction, *, prefix: str) -> RobotAction:
+    rotvec = Rotation.from_quat(
+        np.asarray(
+            [
+                float(action[f"{prefix}ee.qx"]),
+                float(action[f"{prefix}ee.qy"]),
+                float(action[f"{prefix}ee.qz"]),
+                float(action[f"{prefix}ee.qw"]),
+            ],
+            dtype=np.float64,
+        )
+    ).as_rotvec()
+    return {
+        f"{prefix}ee.x": float(action[f"{prefix}ee.x"]),
+        f"{prefix}ee.y": float(action[f"{prefix}ee.y"]),
+        f"{prefix}ee.z": float(action[f"{prefix}ee.z"]),
+        f"{prefix}ee.rotvec_x": float(rotvec[0]),
+        f"{prefix}ee.rotvec_y": float(rotvec[1]),
+        f"{prefix}ee.rotvec_z": float(rotvec[2]),
         f"{prefix}gripper.pos": float(action[f"{prefix}gripper.pos"]),
     }
 
