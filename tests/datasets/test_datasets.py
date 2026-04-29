@@ -17,6 +17,7 @@ import logging
 import re
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -39,6 +40,7 @@ from lerobot.datasets.lerobot_dataset import (
 from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
+    DEFAULT_IMAGE_PATH,
     DEFAULT_VIDEO_FILE_SIZE_IN_MB,
     create_branch,
     get_hf_features_from_features,
@@ -1650,3 +1652,44 @@ def test_delta_timestamps_query_returns_correct_values(tmp_path, empty_lerobot_d
     # Previous frame is outside episode, so it's clamped to first frame and marked as padded
     assert state_values == [10.0, 10.0], f"Expected [10.0, 10.0], got {state_values}"
     assert is_pad == [True, False], f"Expected [True, False], got {is_pad}"
+
+
+def test_clear_episode_buffer_removes_video_frame_dirs(tmp_path):
+    video_key = "observation.images.front"
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    dataset.root = tmp_path
+    dataset.image_writer = None
+    dataset.meta = SimpleNamespace(camera_keys=[video_key], total_episodes=0)
+    dataset.episode_buffer = {"episode_index": 0}
+    dataset.create_episode_buffer = lambda: {"episode_index": 0}
+
+    img_dir = dataset._get_image_file_dir(0, video_key)
+    img_dir.mkdir(parents=True)
+    (img_dir / "frame-000000.png").write_bytes(b"stale")
+
+    dataset.clear_episode_buffer()
+
+    assert not img_dir.exists()
+
+
+def test_encode_video_worker_rejects_stale_extra_frames(tmp_path):
+    video_key = "observation.images.front"
+    img_path = tmp_path / DEFAULT_IMAGE_PATH.format(
+        image_key=video_key,
+        episode_index=0,
+        frame_index=0,
+    )
+    img_path.parent.mkdir(parents=True)
+
+    image = Image.new("RGB", (8, 8), color=(255, 0, 0))
+    image.save(img_path)
+    image.save(img_path.parent / "frame-000001.png")
+
+    with pytest.raises(RuntimeError, match="Unexpected number of temporary frames"):
+        _encode_video_worker(
+            video_key=video_key,
+            episode_index=0,
+            root=tmp_path,
+            fps=30,
+            expected_num_frames=1,
+        )

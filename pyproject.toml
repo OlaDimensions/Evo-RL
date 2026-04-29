@@ -155,6 +155,7 @@ hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.13,<0.2.0", "lerobot[grpci
 # Features
 async = ["lerobot[grpcio-dep]", "matplotlib>=3.10.3,<4.0.0"]
 peft = ["lerobot[transformers-dep]", "peft>=0.18.0,<1.0.0"]
+gui = ["PySide6>=6.6,<7.0", "qt-material>=2.17,<3.0", "QtAwesome>=1.4,<2.0"]
 
 # Development
 dev = ["pre-commit>=3.7.0,<5.0.0", "debugpy>=1.8.1,<1.9.0", "lerobot[grpcio-dep]", "grpcio-tools==1.73.1", "mypy>=1.19.1"]
@@ -213,6 +214,7 @@ lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-human-inloop-record="lerobot.scripts.lerobot_human_inloop_record:main"
+lerobot-human-inloop-record-gui="lerobot.gui.hil_recording.main:main"
 lerobot-filter-dataset-success="lerobot.scripts.lerobot_filter_dataset_success:main"
 lerobot-value-train="lerobot.scripts.lerobot_value_train:main"
 lerobot-value-infer="lerobot.scripts.lerobot_value_infer:main"

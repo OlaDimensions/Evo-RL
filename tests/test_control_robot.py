@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import json
+import logging
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -49,6 +50,7 @@ from lerobot.scripts.ee_pose_action_utils import (
     BIMANUAL_EE_QUAT_NAMES,
     BIMANUAL_EE_RPY_NAMES,
     bimanual_ee_quat_to_rpy_values,
+    tighten_closed_policy_grippers,
 )
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
@@ -292,6 +294,120 @@ def test_record_loop_sets_leader_manual_control_during_reset():
             robot.disconnect()
 
     assert teleop.manual_control_calls == [True]
+
+
+def test_record_loop_logs_compact_handoff_window(tmp_path, caplog):
+    class _Dataset:
+        fps = 30
+        features = {
+            "action": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["motor_1.pos"],
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["motor_1.pos"],
+            },
+        }
+
+        def __init__(self):
+            self.frames = []
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+    class _Runtime:
+        def reset(self):
+            pass
+
+    class _Policy(_Runtime):
+        config = type("Config", (), {"device": "cpu", "use_amp": False})()
+
+    robot = MockRobot(
+        MockRobotConfig(
+            n_motors=1,
+            random_values=False,
+            static_values=[1.0],
+            calibration_dir=tmp_path / "calibration",
+        )
+    )
+    teleop = MockTeleop(
+        MockTeleopConfig(
+            n_motors=1,
+            random_values=False,
+            static_values=[2.0],
+            calibration_dir=tmp_path / "teleop_calibration",
+        )
+    )
+    robot.connect()
+    teleop.connect()
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "toggle_intervention": True,
+        "episode_outcome": None,
+    }
+
+    class _TeleopActionProcessorStep:
+        def __init__(self):
+            self.sync_calls = []
+
+        def sync_from_observation(self, observation):
+            self.sync_calls.append(dict(observation))
+            return True
+
+    class _TeleopActionProcessor:
+        def __init__(self, step):
+            self.steps = [step]
+
+        def __call__(self, payload):
+            events["exit_early"] = True
+            return payload[0]
+
+    teleop_action_processor_step = _TeleopActionProcessorStep()
+    teleop_action_processor = _TeleopActionProcessor(teleop_action_processor_step)
+
+    try:
+        with (
+            caplog.at_level(logging.INFO),
+            patch("lerobot.scripts.recording_loop.precise_sleep", lambda _: None),
+        ):
+            record_loop(
+                robot=robot,
+                events=events,
+                fps=30,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=lambda x: x[0],
+                robot_observation_processor=lambda x: x,
+                dataset=_Dataset(),
+                teleop=teleop,
+                policy=_Policy(),
+                preprocessor=_Runtime(),
+                postprocessor=_Runtime(),
+                policy_features={
+                    "action": {"dtype": "float32", "shape": (1,), "names": ["motor_1.pos"]},
+                    "observation.state": {"dtype": "float32", "shape": (1,), "names": ["motor_1.pos"]},
+                },
+                control_time_s=10.0,
+                handoff_debug_log_frames=1,
+            )
+    finally:
+        if teleop.is_connected:
+            teleop.disconnect()
+        if robot.is_connected:
+            robot.disconnect()
+
+    handoff_records = [record for record in caplog.records if "[HIL_HANDOFF]" in record.getMessage()]
+    assert len(handoff_records) == 1
+    assert len(teleop_action_processor_step.sync_calls) == 1
+    handoff_message = handoff_records[0].getMessage()
+    assert "source=teleop" in handoff_message
+    assert "teleop_raw=" in handoff_message
+    assert "final=" in handoff_message
+    assert "sent=" in handoff_message
 
 
 def test_record_loop_adapts_policy_ee_action_before_robot_send(tmp_path):
@@ -772,9 +888,14 @@ def test_record_loop_suppresses_bimanual_ee_motion_on_policy_release_baseline(tm
     class _PolicyActionAdapter:
         def __init__(self):
             self.calls = []
+            self.anchor_calls = []
 
         def reset(self):
             pass
+
+        def anchor_absolute_target_from_observation(self, action, observation):
+            self.anchor_calls.append((dict(action), dict(observation)))
+            return True
 
         def __call__(self, payload):
             action, observation = payload
@@ -884,6 +1005,10 @@ def test_record_loop_suppresses_bimanual_ee_motion_on_policy_release_baseline(tm
 
     release_baseline_action, _ = policy_action_processor.calls[0]
     right_only_action, _ = policy_action_processor.calls[1]
+    assert len(policy_action_processor.anchor_calls) == 1
+    anchored_action, _ = policy_action_processor.anchor_calls[0]
+    assert anchored_action["left_ee.x"] == pytest.approx(0.1, abs=1e-6)
+    assert anchored_action["right_ee.x"] == pytest.approx(0.4, abs=1e-6)
     assert release_baseline_action["left_enabled"] is False
     assert release_baseline_action["right_enabled"] is False
     assert right_only_action["left_enabled"] is False
@@ -1181,6 +1306,85 @@ def test_record_config_rejects_negative_cfg_beta():
             play_sounds=False,
             acp_inference=ACPInferenceConfig(enable=True, use_cfg=False, cfg_beta=-0.1),
         )
+
+
+def test_record_config_rejects_invalid_gripper_tighten_threshold_ordering():
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+
+    with pytest.raises(ValueError, match="policy_gripper_tighten_release_threshold"):
+        RecordConfig(
+            robot=robot_cfg,
+            dataset=dataset_cfg,
+            teleop=teleop_cfg,
+            play_sounds=False,
+            policy_gripper_tighten_enter_threshold=55.0,
+            policy_gripper_tighten_release_threshold=40.0,
+        )
+
+
+def test_tighten_closed_policy_gripper_uses_hysteresis_without_mutating_input():
+    tightened_keys: set[str] = set()
+    action = {"ee.x": 0.1, "gripper.pos": 39.9}
+
+    tightened = tighten_closed_policy_grippers(
+        action,
+        tightened_keys,
+        enter_threshold=40.0,
+        release_threshold=55.0,
+        tighten_value=0.0,
+    )
+    transition = tighten_closed_policy_grippers(
+        {"gripper.pos": 54.9},
+        tightened_keys,
+        enter_threshold=40.0,
+        release_threshold=55.0,
+        tighten_value=0.0,
+    )
+    released = tighten_closed_policy_grippers(
+        {"gripper.pos": 55.0},
+        tightened_keys,
+        enter_threshold=40.0,
+        release_threshold=55.0,
+        tighten_value=0.0,
+    )
+
+    assert tightened == {"ee.x": 0.1, "gripper.pos": 0.0}
+    assert action["gripper.pos"] == 39.9
+    assert transition["gripper.pos"] == 0.0
+    assert released["gripper.pos"] == 55.0
+    assert tightened_keys == set()
+
+
+def test_tighten_closed_policy_gripper_tracks_bimanual_keys_independently():
+    tightened_keys: set[str] = set()
+
+    first = tighten_closed_policy_grippers(
+        {"left_gripper.pos": 39.0, "right_gripper.pos": 60.0},
+        tightened_keys,
+        enter_threshold=40.0,
+        release_threshold=55.0,
+        tighten_value=0.0,
+    )
+    second = tighten_closed_policy_grippers(
+        {"left_gripper.pos": 54.0, "right_gripper.pos": 39.0},
+        tightened_keys,
+        enter_threshold=40.0,
+        release_threshold=55.0,
+        tighten_value=0.0,
+    )
+
+    assert first == {"left_gripper.pos": 0.0, "right_gripper.pos": 60.0}
+    assert second == {"left_gripper.pos": 0.0, "right_gripper.pos": 0.0}
+    assert tightened_keys == {"left_gripper.pos", "right_gripper.pos"}
 
 
 def test_acp_inference_without_cfg_appends_positive_prompt():

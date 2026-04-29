@@ -258,6 +258,24 @@ def init_keyboard_listener(
     events["episode_outcome"] = None
 
     listener = None
+    force_tty = os.environ.get("LEROBOT_FORCE_TTY_KEYBOARD", "").lower() in {"1", "true", "yes"}
+    if force_tty:
+        if sys.stdin.isatty():
+            listener = TTYKeyboardListener(
+                events=events,
+                intervention_toggle_key=intervention_toggle_key,
+                episode_success_key=episode_success_key,
+                episode_failure_key=episode_failure_key,
+            )
+            listener.start()
+            logging.warning("Using forced terminal keyboard controls over the current TTY.")
+        else:
+            logging.warning(
+                "LEROBOT_FORCE_TTY_KEYBOARD is set, but stdin is not an interactive TTY. "
+                "Keyboard inputs will not be available."
+            )
+        return listener, events
+
     if not is_headless():
         # Only import pynput if not in a headless environment
         from pynput import keyboard

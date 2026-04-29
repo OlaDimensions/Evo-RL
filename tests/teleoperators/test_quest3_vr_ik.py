@@ -123,6 +123,12 @@ class FakeBackend:
     def clear_previous_q(self):
         self.previous_q = None
 
+    def fk(self, q):
+        T = np.eye(4, dtype=np.float64)
+        q_arr = np.asarray(q, dtype=np.float64)
+        T[:3, 3] = q_arr[:3]
+        return T
+
     def solve(self, target_T, q_seed=None):
         self.calls.append((target_T.copy(), None if q_seed is None else q_seed.copy()))
         return type(
@@ -259,6 +265,30 @@ def test_piper_backend_warm_start_rejects_invalid_previous_q():
     backend._q_prev = np.array([0.1, np.nan, 0.3, 0.4, 0.5, 0.6], dtype=np.float64)
 
     np.testing.assert_allclose(backend._warm_start(None), np.zeros(6, dtype=np.float64), atol=1e-12)
+
+
+def test_piper_backend_warm_start_clips_out_of_limit_seed():
+    backend = _piper_backend_without_solver()
+    q_seed = np.array([1.5, -1.5, 0.3, -0.4, 0.5, -0.6], dtype=np.float64)
+
+    np.testing.assert_allclose(
+        backend._warm_start(q_seed),
+        np.array([1.0, -1.0, 0.3, -0.4, 0.5, -0.6], dtype=np.float64),
+        atol=1e-12,
+    )
+
+
+def test_piper_backend_set_previous_q_clips_out_of_limit_update():
+    backend = _piper_backend_without_solver()
+    q_prev = np.array([1.5, -1.5, 0.3, -0.4, 0.5, -0.6], dtype=np.float64)
+
+    backend.set_previous_q(q_prev)
+
+    np.testing.assert_allclose(
+        backend._q_prev,
+        np.array([1.0, -1.0, 0.3, -0.4, 0.5, -0.6], dtype=np.float64),
+        atol=1e-12,
+    )
 
 
 def test_piper_backend_rejects_large_joint_jump_solution():
@@ -984,6 +1014,52 @@ def test_ee_to_joint_ik_invalid_observation_seed_falls_back_to_home():
     _, q_seed = backend.calls[-1]
     assert q_seed is not None
     np.testing.assert_allclose(q_seed, np.zeros(6, dtype=np.float64), atol=1e-9)
+
+
+def test_ee_to_joint_ik_sync_from_observation_replaces_stale_command_baseline():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(ik_backend=backend, async_solve=False)
+    step._state.last_command_q = np.full(6, 0.9, dtype=np.float64)
+    step._state.last_q = np.full(6, 0.8, dtype=np.float64)
+    step._state.async_action_ready = {"joint_1.pos": 1.0}
+    step._state.ik_inflight = True
+    obs_deg = {key: 30.0 for key in PIPER_JOINT_ACTION_KEYS}
+
+    assert step.sync_from_observation(obs_deg) is True
+
+    expected_q = np.deg2rad(np.full(6, 30.0, dtype=np.float64))
+    np.testing.assert_allclose(step._state.last_command_q, expected_q, atol=1e-12)
+    np.testing.assert_allclose(step._state.last_q, expected_q, atol=1e-12)
+    np.testing.assert_allclose(backend.previous_q, expected_q, atol=1e-12)
+    assert step._state.async_action_ready is None
+    assert step._state.ik_inflight is False
+
+
+def test_ee_to_joint_ik_absolute_anchor_maps_policy_target_relative_to_observation_fk():
+    backend = FakeBackend()
+    step = EEToJointIKProcessorStep(ik_backend=backend, async_solve=False)
+    obs_deg = {key: 10.0 for key in PIPER_JOINT_ACTION_KEYS}
+    baseline_action = {
+        "enabled": False,
+        "ee.target_x": 1.0,
+        "ee.target_y": 2.0,
+        "ee.target_z": 3.0,
+        "ee.target_rx": 0.0,
+        "ee.target_ry": 0.0,
+        "ee.target_rz": 0.0,
+        "gripper.pos": 0.08,
+    }
+    next_action = {
+        **baseline_action,
+        "enabled": True,
+        "ee.target_x": 1.02,
+    }
+
+    assert step.anchor_absolute_target_from_observation(baseline_action, obs_deg) is True
+    _ = step(create_transition(observation=obs_deg, action=next_action))["action"]
+
+    expected_xyz = np.deg2rad(np.full(3, 10.0, dtype=np.float64)) + np.array([0.02, 0.0, 0.0])
+    np.testing.assert_allclose(backend.calls[-1][0][:3, 3], expected_xyz, atol=1e-12)
 
 
 def test_dual_ik_step_preserves_left_right_output_prefixes():
