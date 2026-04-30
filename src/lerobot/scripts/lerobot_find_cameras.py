@@ -29,7 +29,9 @@ lerobot-find-cameras
 
 import argparse
 import concurrent.futures
+import contextlib
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,22 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 logger = logging.getLogger(__name__)
 
 
+@contextlib.contextmanager
+def suppress_native_stderr():
+    """Silence camera backends that write probe errors directly to fd 2."""
+
+    stderr_fd = 2
+    saved_fd = os.dup(stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved_fd, stderr_fd)
+        os.close(saved_fd)
+        os.close(devnull_fd)
+
+
 def find_all_opencv_cameras() -> list[dict[str, Any]]:
     """
     Finds all available OpenCV cameras plugged into the system.
@@ -56,7 +74,8 @@ def find_all_opencv_cameras() -> list[dict[str, Any]]:
     all_opencv_cameras_info: list[dict[str, Any]] = []
     logger.info("Searching for OpenCV cameras...")
     try:
-        opencv_cameras = OpenCVCamera.find_cameras()
+        with suppress_native_stderr():
+            opencv_cameras = OpenCVCamera.find_cameras()
         for cam_info in opencv_cameras:
             all_opencv_cameras_info.append(cam_info)
         logger.info(f"Found {len(opencv_cameras)} OpenCV cameras.")
@@ -231,6 +250,7 @@ def save_images_from_all_cameras(
     output_dir: Path,
     record_time_s: float = 2.0,
     camera_type: str | None = None,
+    camera_id: str | None = None,
 ):
     """
     Connects to detected cameras (optionally filtered by type) and saves images from each.
@@ -245,6 +265,12 @@ def save_images_from_all_cameras(
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving images to {output_dir}")
     all_camera_metadata = find_and_print_cameras(camera_type_filter=camera_type)
+
+    if camera_id is not None:
+        all_camera_metadata = [meta for meta in all_camera_metadata if str(meta.get("id")) == camera_id]
+        if not all_camera_metadata:
+            logger.warning(f"No camera matched id={camera_id!r}. Cannot save images.")
+            return
 
     if not all_camera_metadata:
         logger.warning("No cameras detected matching the criteria. Cannot save images.")
@@ -311,8 +337,27 @@ def main():
         default=6.0,
         help="Time duration to attempt capturing frames. Default: 6 seconds.",
     )
+    parser.add_argument(
+        "--capture",
+        action="store_true",
+        help="Connect to detected cameras and save preview images. By default, cameras are only listed.",
+    )
+    parser.add_argument(
+        "--camera-id",
+        type=str,
+        default=None,
+        help="Optional camera id to capture from, e.g. /dev/video5 or a RealSense serial.",
+    )
     args = parser.parse_args()
-    save_images_from_all_cameras(**vars(args))
+    if args.capture:
+        save_images_from_all_cameras(
+            output_dir=args.output_dir,
+            record_time_s=args.record_time_s,
+            camera_type=args.camera_type,
+            camera_id=args.camera_id,
+        )
+    else:
+        find_and_print_cameras(camera_type_filter=args.camera_type)
 
 
 if __name__ == "__main__":

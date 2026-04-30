@@ -155,6 +155,7 @@ hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.13,<0.2.0", "lerobot[grpci
 # Features
 async = ["lerobot[grpcio-dep]", "matplotlib>=3.10.3,<4.0.0"]
 peft = ["lerobot[transformers-dep]", "peft>=0.18.0,<1.0.0"]
+quest3_vr = ["casadi>=3.6.7,<3.8.0"]
 gui = ["PySide6>=6.6,<7.0", "qt-material>=2.17,<3.0", "QtAwesome>=1.4,<2.0"]
 
 # Development

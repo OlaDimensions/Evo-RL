@@ -8,11 +8,52 @@ ROBOT_LEFT_PORT="${ROBOT_LEFT_PORT:-can_left}"
 ROBOT_RIGHT_PORT="${ROBOT_RIGHT_PORT:-can_right}"
 ROBOT_LEFT_REQUIRE_CALIBRATION="${ROBOT_LEFT_REQUIRE_CALIBRATION:-false}"
 ROBOT_RIGHT_REQUIRE_CALIBRATION="${ROBOT_RIGHT_REQUIRE_CALIBRATION:-false}"
-ROBOT_LEFT_CAMERAS=${ROBOT_LEFT_CAMERAS:-'{}'}
-ROBOT_RIGHT_CAMERAS=${ROBOT_RIGHT_CAMERAS:-'{}'}
+CAMERA_PROFILE="${CAMERA_PROFILE:-gopro}"
 
 # ROBOT_LEFT_CAMERAS=${ROBOT_LEFT_CAMERAS:-'{"wrist": {"type": "intelrealsense", "serial_number_or_name": "152122072280", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}'}
 # ROBOT_RIGHT_CAMERAS=${ROBOT_RIGHT_CAMERAS:-'{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}'}
+
+DEFAULT_REALSENSE_LEFT_CAMERAS='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "152122072280", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}'
+DEFAULT_REALSENSE_RIGHT_CAMERAS='{"wrist": {"type": "intelrealsense", "serial_number_or_name": "008222070618", "width": 640, "height":480, "fps": 30, "warmup_s": 2}, "front": {"type": "intelrealsense", "serial_number_or_name": "213622074413", "width": 640, "height":480, "fps": 30, "warmup_s": 2}}'
+
+GOPRO_CAPTURE_WIDTH="${GOPRO_CAPTURE_WIDTH:-1920}"
+GOPRO_CAPTURE_HEIGHT="${GOPRO_CAPTURE_HEIGHT:-1080}"
+GOPRO_WIDTH="${GOPRO_WIDTH:-448}"
+GOPRO_HEIGHT="${GOPRO_HEIGHT:-448}"
+GOPRO_FPS="${GOPRO_FPS:-30}"
+GOPRO_CROP_RATIO="${GOPRO_CROP_RATIO:-1.0}"
+GOPRO_FOURCC="${GOPRO_FOURCC:-MJPG}"
+GOPRO_LEFT_WRIST_INDEX_OR_PATH="${GOPRO_LEFT_WRIST_INDEX_OR_PATH:-/dev/video0}"
+GOPRO_RIGHT_WRIST_INDEX_OR_PATH="${GOPRO_RIGHT_WRIST_INDEX_OR_PATH:-/dev/video2}"
+GOPRO_RIGHT_FRONT_INDEX_OR_PATH="${GOPRO_RIGHT_FRONT_INDEX_OR_PATH:-/dev/video4}"
+
+DEFAULT_GOPRO_LEFT_CAMERAS="{\"wrist\": {\"type\": \"gopro\", \"index_or_path\": \"$GOPRO_LEFT_WRIST_INDEX_OR_PATH\", \"capture_width\": $GOPRO_CAPTURE_WIDTH, \"capture_height\": $GOPRO_CAPTURE_HEIGHT, \"width\": $GOPRO_WIDTH, \"height\": $GOPRO_HEIGHT, \"fps\": $GOPRO_FPS, \"crop_ratio\": $GOPRO_CROP_RATIO, \"fourcc\": \"$GOPRO_FOURCC\", \"warmup_s\": 2}}"
+DEFAULT_GOPRO_RIGHT_CAMERAS="{\"wrist\": {\"type\": \"gopro\", \"index_or_path\": \"$GOPRO_RIGHT_WRIST_INDEX_OR_PATH\", \"capture_width\": $GOPRO_CAPTURE_WIDTH, \"capture_height\": $GOPRO_CAPTURE_HEIGHT, \"width\": $GOPRO_WIDTH, \"height\": $GOPRO_HEIGHT, \"fps\": $GOPRO_FPS, \"crop_ratio\": $GOPRO_CROP_RATIO, \"fourcc\": \"$GOPRO_FOURCC\", \"warmup_s\": 2}, \"front\": {\"type\": \"gopro\", \"index_or_path\": \"$GOPRO_RIGHT_FRONT_INDEX_OR_PATH\", \"capture_width\": $GOPRO_CAPTURE_WIDTH, \"capture_height\": $GOPRO_CAPTURE_HEIGHT, \"width\": $GOPRO_WIDTH, \"height\": $GOPRO_HEIGHT, \"fps\": $GOPRO_FPS, \"crop_ratio\": $GOPRO_CROP_RATIO, \"fourcc\": \"$GOPRO_FOURCC\", \"warmup_s\": 2}}"
+
+case "$CAMERA_PROFILE" in
+  none)
+    ROBOT_LEFT_CAMERAS='{}'
+    ROBOT_RIGHT_CAMERAS='{}'
+    ;;
+  realsense)
+    ROBOT_LEFT_CAMERAS="$DEFAULT_REALSENSE_LEFT_CAMERAS"
+    ROBOT_RIGHT_CAMERAS="$DEFAULT_REALSENSE_RIGHT_CAMERAS"
+    ;;
+  gopro)
+    ROBOT_LEFT_CAMERAS="$DEFAULT_GOPRO_LEFT_CAMERAS"
+    ROBOT_RIGHT_CAMERAS="$DEFAULT_GOPRO_RIGHT_CAMERAS"
+    ;;
+  custom)
+    if [[ -z "${ROBOT_LEFT_CAMERAS+x}" || -z "${ROBOT_RIGHT_CAMERAS+x}" ]]; then
+      echo "[evo-rl] ERROR: CAMERA_PROFILE=custom requires ROBOT_LEFT_CAMERAS and ROBOT_RIGHT_CAMERAS." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "[evo-rl] ERROR: unknown CAMERA_PROFILE '$CAMERA_PROFILE'. Use none, realsense, gopro, or custom." >&2
+    exit 1
+    ;;
+esac
 
 TELEOP_TYPE="${TELEOP_TYPE:-bi_quest3_vr}"
 TELEOP_ID="${TELEOP_ID:-my_bi_vr_leader}"
@@ -114,4 +155,5 @@ exec env \
   PYTHONPATH="$VT3_SITE:${PYTHONPATH:-}" \
   LD_LIBRARY_PATH="$VT3_ROOT/lib:${LD_LIBRARY_PATH:-}" \
   lerobot-human-inloop-record \
-  "${RECORD_ARGS[@]}"
+  "${RECORD_ARGS[@]}" \
+  "$@"

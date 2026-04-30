@@ -157,7 +157,7 @@ class RecordingController:
             if dataset_path.exists():
                 self.append_controller_log(f"[gui] resuming existing dataset: {dataset_path}\n")
                 return params
-            raise ValueError(f"Cannot resume because dataset directory does not exist:\n{dataset_path}")
+            raise ValueError(f"Cannot resume because dataset directory does not exist: {dataset_path}")
 
         if not dataset_path.exists():
             return params
@@ -176,7 +176,7 @@ class RecordingController:
 
         self.append_controller_log(f"[gui] dataset conflict choice=cancel path={dataset_path}\n")
         self.append_controller_log(
-            f"[gui] dataset already exists: {dataset_path}. Rename Dataset Name or enable resume.\n"
+            f"[gui] dataset already exists: {dataset_path}. Rename Dataset Name, delete it, or resume.\n"
         )
         self.window.focus_parameter("dataset_name")
         raise RecordingStartCancelled()

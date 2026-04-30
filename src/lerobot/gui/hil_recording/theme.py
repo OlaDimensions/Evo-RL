@@ -15,6 +15,16 @@ QMainWindow, QWidget#MainRoot {
     background: #12181f;
 }
 
+QWidget#ParameterPanel,
+QScrollArea#ParameterScroll,
+QScrollArea#ParameterScroll QWidget#qt_scrollarea_viewport {
+    background: #12181f;
+}
+
+QScrollArea#ParameterScroll {
+    border: 0;
+}
+
 QFrame#HeaderFrame {
     background: #17212b;
     border: 1px solid #263545;

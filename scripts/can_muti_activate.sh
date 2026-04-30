@@ -4,8 +4,8 @@ declare -A USB_PORTS
 # USB_PORTS["3-1.3:1.0"]="can_arm:1000000"
 # USB_PORTS["3-6.4.3:1.0"]="can_left:1000000"
 # USB_PORTS["3-6.4.2:1.0"]="can_right:1000000"
-USB_PORTS["1-1.3:1.0"]="can_left:1000000"
-USB_PORTS["1-1.4:1.0"]="can_right:1000000"
+USB_PORTS["1-1.4:1.0"]="can_left:1000000"
+USB_PORTS["1-1.3:1.0"]="can_right:1000000"
 # USB_PORTS["3-1.5:1.0"]="can_arm1:1000000"
 
 # Whether to ignore CAN quantity check (default false)

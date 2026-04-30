@@ -1,0 +1,37 @@
+name: evo-rl-vr-gui
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+
+  # VR IK performance-sensitive native stack, pinned to the fast evo-rl-v1 baseline.
+  - casadi=3.6.7
+  - ipopt=3.14.17
+  - pinocchio=3.2.0
+  - hpp-fcl=2.4.5
+  - eigenpy=3.10.0
+  - libblas=*=*openblas
+  - libopenblas
+  - mumps-seq=5.7.3
+  - libspral=2025.03.06
+  - libscotch=7.0.4
+
+  # GUI/system libraries that conda should resolve with the native stack.
+  - dbus
+  - libegl
+  - libgl
+  - libxcb
+  - libxkbcommon
+  - xorg-libx11
+  - xorg-libxext
+  - xorg-libxfixes
+  - xorg-libxi
+  - xorg-libxrandr
+  - xorg-libxrender
+  - xorg-libxtst
+
+  - pip:
+      - -r requirements-vr-gui-lock.txt
+      - --no-deps
+      - -e .

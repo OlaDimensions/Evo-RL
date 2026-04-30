@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTextEdit,
     QVBoxLayout,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
 
 from lerobot.gui.hil_recording.config_store import load_config, save_config
 from lerobot.gui.hil_recording.models import (
+    CAMERA_PARAMETER_KEYS,
+    CAMERA_SLOT_SPECS,
     DEFAULT_PARAMETER_SPECS,
     HardwareHealthReport,
     HealthCheckResult,
@@ -29,6 +32,7 @@ from lerobot.gui.hil_recording.models import (
     RecordingParameters,
     RecordingState,
     StatusLevel,
+    migrate_legacy_camera_parameters,
 )
 
 
@@ -55,8 +59,8 @@ DATASET_PARAMETER_KEYS = {
     "dataset_num_episodes",
     "dataset_episode_time_s",
     "dataset_reset_time_s",
-    "resume",
 }
+CAMERA_PARAMETER_KEYS_SET = set(CAMERA_PARAMETER_KEYS)
 
 def _icon(name: str, color: str = "#e8f0fa") -> QIcon:
     try:
@@ -129,14 +133,16 @@ class StatusLight(QFrame):
 class ParameterPanel(QWidget):
     def __init__(self, specs: list[ParameterSpec] | None = None, values: dict[str, str] | None = None):
         super().__init__()
+        self.setObjectName("ParameterPanel")
         self.specs = specs or DEFAULT_PARAMETER_SPECS
-        values = values or {}
+        values = migrate_legacy_camera_parameters(values or {})
         self.editors: dict[str, QCheckBox | QLineEdit | QTextEdit | QComboBox] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
         dataset_group, dataset_layout = _form_group("Dataset")
+        camera_group, camera_layout = _form_group("Cameras")
         policy_group, policy_layout = _form_group("Policy")
 
         for spec in self.specs:
@@ -153,6 +159,8 @@ class ParameterPanel(QWidget):
                     editor.setCurrentIndex(default_index)
                 if spec.key == "policy_mode":
                     editor.currentIndexChanged.connect(self._update_policy_controls)
+                if spec.key.endswith("_camera_type"):
+                    editor.currentIndexChanged.connect(self._update_camera_controls)
             elif spec.key == "dataset_single_task":
                 editor = QTextEdit(initial_value)
                 editor.setObjectName("TaskEditor")
@@ -166,12 +174,19 @@ class ParameterPanel(QWidget):
 
             label = QLabel(spec.label)
             label.setObjectName("FormLabel")
-            target_layout = dataset_layout if spec.key in DATASET_PARAMETER_KEYS else policy_layout
+            if spec.key in DATASET_PARAMETER_KEYS:
+                target_layout = dataset_layout
+            elif spec.key in CAMERA_PARAMETER_KEYS_SET:
+                target_layout = camera_layout
+            else:
+                target_layout = policy_layout
             target_layout.addRow(label, editor)
 
         layout.addWidget(dataset_group)
+        layout.addWidget(camera_group)
         layout.addWidget(policy_group)
         layout.addStretch(1)
+        self._update_camera_controls()
         self._update_policy_controls()
 
     def parameters(self) -> RecordingParameters:
@@ -209,21 +224,46 @@ class ParameterPanel(QWidget):
         for editor in self.editors.values():
             editor.setEnabled(editable)
         if editable:
+            self._update_camera_controls()
             self._update_policy_controls()
+
+    def _update_camera_controls(self) -> None:
+        for slot in CAMERA_SLOT_SPECS:
+            type_editor = self.editors.get(f"{slot.key}_camera_type")
+            if not isinstance(type_editor, QComboBox):
+                continue
+            camera_type = str(type_editor.currentData())
+            id_editor = self.editors.get(f"{slot.key}_camera_id")
+            if id_editor is not None:
+                id_editor.setEnabled(camera_type != "none")
 
     def _update_policy_controls(self) -> None:
         policy_mode_editor = self.editors.get("policy_mode")
         if not isinstance(policy_mode_editor, QComboBox):
             return
         mode = str(policy_mode_editor.currentData())
-        for key in ("policy_path", "openpi_policy_dir", "openpi_server_root", "policy_host", "policy_port"):
+        for key in (
+            "policy_path",
+            "openpi_policy_dir",
+            "openpi_policy_config",
+            "openpi_server_root",
+            "policy_host",
+            "policy_port",
+        ):
             editor = self.editors.get(key)
             if editor is None:
                 continue
             editor.setEnabled(
                 (key == "policy_path" and mode == "local_path")
                 or (
-                    key in {"openpi_policy_dir", "openpi_server_root", "policy_host", "policy_port"}
+                    key
+                    in {
+                        "openpi_policy_dir",
+                        "openpi_policy_config",
+                        "openpi_server_root",
+                        "policy_host",
+                        "policy_port",
+                    }
                     and mode == "openpi_remote"
                 )
             )
@@ -257,12 +297,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(header)
 
         self.parameter_panel = ParameterPanel(values=saved_values)
-        self.parameter_panel.setMinimumWidth(430)
-        self.parameter_panel.setMaximumWidth(520)
+        parameter_scroll = QScrollArea()
+        parameter_scroll.setObjectName("ParameterScroll")
+        parameter_scroll.setWidgetResizable(True)
+        parameter_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        parameter_scroll.setMinimumWidth(430)
+        parameter_scroll.setMaximumWidth(560)
+        parameter_scroll.setWidget(self.parameter_panel)
 
         body = QHBoxLayout()
         body.setSpacing(14)
-        body.addWidget(self.parameter_panel)
+        body.addWidget(parameter_scroll)
 
         workbench = QVBoxLayout()
         workbench.setSpacing(14)

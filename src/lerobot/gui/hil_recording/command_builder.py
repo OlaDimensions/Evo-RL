@@ -10,7 +10,7 @@ from lerobot.gui.hil_recording.models import RecordingParameters
 
 DEFAULT_RECORD_SCRIPT = Path(__file__).resolve().with_name("run_teleop_with_vt3_ik.sh")
 DEFAULT_OPENPI_SERVER_ROOT = Path("/home/ola/code/openpi")
-OPENPI_SERVER_POLICY_CONFIG = "pi05_bipiper_absolute_lora"
+DEFAULT_OPENPI_SERVER_POLICY_CONFIG = "pi05_bipiper_absolute_lora"
 
 PARAMETER_CLI_ARGS = {
     "dataset_name": "--dataset.repo_id",
@@ -130,13 +130,17 @@ class OpenPIServerCommandBuilder:
             raise ValueError(f"OpenPI serve script not found: {server_root / 'scripts' / 'serve_policy.py'}")
 
         policy_port = params.get("policy_port", "8000") or "8000"
+        policy_config = (
+            params.get("openpi_policy_config", DEFAULT_OPENPI_SERVER_POLICY_CONFIG)
+            or DEFAULT_OPENPI_SERVER_POLICY_CONFIG
+        )
 
         return [
             "uv",
             "run",
             "scripts/serve_policy.py",
-            "policy:checkpoint",
-            f"--policy.config={OPENPI_SERVER_POLICY_CONFIG}",
-            f"--policy.dir={policy_dir}",
             f"--port={policy_port}",
+            "policy:checkpoint",
+            f"--policy.config={policy_config}",
+            f"--policy.dir={policy_dir}",
         ]

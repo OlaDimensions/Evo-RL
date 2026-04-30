@@ -9,7 +9,13 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from lerobot.gui.hil_recording.models import HardwareHealthReport, HealthCheckResult, StatusLevel
+from lerobot.gui.hil_recording.models import (
+    HardwareHealthReport,
+    HealthCheckResult,
+    RecordingParameters,
+    StatusLevel,
+    robot_camera_env_from_params,
+)
 
 
 @dataclass(frozen=True)
@@ -87,7 +93,7 @@ def suppress_native_stderr() -> Iterator[None]:
 def _extract_serials_from_value(value: Any) -> list[str]:
     serials: list[str] = []
     if isinstance(value, dict):
-        serial = value.get("serial_number_or_name")
+        serial = value.get("serial_number_or_name") if value.get("type") in {None, "intelrealsense"} else None
         if serial is not None:
             serials.append(str(serial))
         for item in value.values():
@@ -98,12 +104,39 @@ def _extract_serials_from_value(value: Any) -> list[str]:
     return serials
 
 
-def camera_serials_from_env(env: dict[str, str] | None = None) -> list[str]:
+def _extract_gopro_paths_from_value(value: Any) -> list[str]:
+    paths: list[str] = []
+    if isinstance(value, dict):
+        if value.get("type") == "gopro" and value.get("index_or_path") is not None:
+            paths.append(str(value["index_or_path"]))
+        for item in value.values():
+            paths.extend(_extract_gopro_paths_from_value(item))
+    elif isinstance(value, list):
+        for item in value:
+            paths.extend(_extract_gopro_paths_from_value(item))
+    return paths
+
+
+def _camera_env_values(env: dict[str, str] | None = None) -> tuple[str, str]:
     env = env or {}
-    values = (
-        env.get("ROBOT_LEFT_CAMERAS") or os.environ.get("ROBOT_LEFT_CAMERAS") or DEFAULT_ROBOT_LEFT_CAMERAS,
-        env.get("ROBOT_RIGHT_CAMERAS") or os.environ.get("ROBOT_RIGHT_CAMERAS") or DEFAULT_ROBOT_RIGHT_CAMERAS,
+    left = env.get("ROBOT_LEFT_CAMERAS") or os.environ.get("ROBOT_LEFT_CAMERAS")
+    right = env.get("ROBOT_RIGHT_CAMERAS") or os.environ.get("ROBOT_RIGHT_CAMERAS")
+    if left is not None and right is not None:
+        return left, right
+
+    camera_profile = env.get("CAMERA_PROFILE") or os.environ.get("CAMERA_PROFILE") or "gopro"
+    if camera_profile == "custom":
+        return left or "{}", right or "{}"
+
+    fallback = robot_camera_env_from_params(RecordingParameters({"camera_profile": camera_profile}))
+    return (
+        left if left is not None else fallback["ROBOT_LEFT_CAMERAS"],
+        right if right is not None else fallback["ROBOT_RIGHT_CAMERAS"],
     )
+
+
+def camera_serials_from_env(env: dict[str, str] | None = None) -> list[str]:
+    values = _camera_env_values(env)
     serials: list[str] = []
     for raw in values:
         try:
@@ -111,6 +144,27 @@ def camera_serials_from_env(env: dict[str, str] | None = None) -> list[str]:
         except Exception:
             continue
     return sorted(set(serials))
+
+
+def gopro_paths_from_env(env: dict[str, str] | None = None) -> list[str]:
+    values = _camera_env_values(env)
+    paths: list[str] = []
+    for raw in values:
+        try:
+            paths.extend(_extract_gopro_paths_from_value(json.loads(raw)))
+        except Exception:
+            continue
+    return sorted(set(paths))
+
+
+def _missing_gopro_paths(paths: list[str]) -> list[str]:
+    missing = []
+    for raw_path in paths:
+        if raw_path.isdigit():
+            continue
+        if not Path(raw_path).exists():
+            missing.append(raw_path)
+    return missing
 
 
 def _camera_id(camera: dict[str, Any]) -> str | None:
@@ -123,8 +177,15 @@ def _camera_id(camera: dict[str, Any]) -> str | None:
 
 def check_camera_status(env: dict[str, str] | None = None) -> HealthCheckResult:
     target_serials = camera_serials_from_env(env)
+    gopro_paths = gopro_paths_from_env(env)
+    missing_gopro_paths = _missing_gopro_paths(gopro_paths)
+    if missing_gopro_paths:
+        return HealthCheckResult("Camera", StatusLevel.ERROR, f"Missing GoPro paths: {', '.join(missing_gopro_paths)}")
+
     if not target_serials:
-        return HealthCheckResult("Camera", StatusLevel.WARNING, "No target camera serials configured")
+        if gopro_paths:
+            return HealthCheckResult("Camera", StatusLevel.OK, f"GoPro paths configured: {', '.join(gopro_paths)}")
+        return HealthCheckResult("Camera", StatusLevel.WARNING, "No cameras configured")
 
     try:
         from lerobot.scripts.lerobot_find_cameras import find_all_realsense_cameras
@@ -139,10 +200,14 @@ def check_camera_status(env: dict[str, str] | None = None) -> HealthCheckResult:
 
     seen = {camera_id for camera in cameras if (camera_id := _camera_id(camera))}
     missing = [serial for serial in target_serials if serial not in seen]
-    if not missing:
-        return HealthCheckResult("Camera", StatusLevel.OK, f"Target cameras online: {', '.join(target_serials)}")
-    detail = f"Missing: {', '.join(missing)}; seen: {', '.join(sorted(seen)) or 'none'}"
-    return HealthCheckResult("Camera", StatusLevel.ERROR, detail)
+    if missing:
+        detail = f"Missing RealSense: {', '.join(missing)}; seen: {', '.join(sorted(seen)) or 'none'}"
+        return HealthCheckResult("Camera", StatusLevel.ERROR, detail)
+
+    details = [f"RealSense online: {', '.join(target_serials)}"]
+    if gopro_paths:
+        details.append(f"GoPro paths configured: {', '.join(gopro_paths)}")
+    return HealthCheckResult("Camera", StatusLevel.OK, "; ".join(details))
 
 
 def _can_statuses(interfaces: tuple[str, ...]) -> tuple[int, list[str]]:
